@@ -15,7 +15,12 @@ CONFIG_WIFI_CONNECT_TIMEOUT_MS=8000
 CONFIG_WIFI_MAX_CONNECT_ATTEMPTS=3
 CONFIG_WIFI_USE_COUNT_SAVE_INTERVAL=5
 CONFIG_WIFI_SCAN_HIDDEN=n
-CONFIG_WIFI_PROV_AUTH_MODE=2
+CONFIG_WIFI_PROV_AUTH_MODE_MAC_POP=y
+# Headless devices (no console for the operator to read a MAC-derived PoP
+# from): use a fixed PoP known ahead of time instead. Uncomment these two
+# lines and comment out the MAC_POP line above:
+#   CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP=y
+#   CONFIG_WIFI_PROV_POP="your-fixed-pop-here"
 CONFIG_WIFI_PROV_TIMEOUT_MS=300000
 CONFIG_WIFI_PROV_DEVICE_NAME_PREFIX="PROV_"
 

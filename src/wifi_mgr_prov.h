@@ -27,7 +27,7 @@ extern "C" {
  * @brief Initialize and start BLE provisioning.
  *
  * Builds device name from config prefix + MAC suffix.
- * Resolves auth mode from CONFIG_WIFI_PROV_AUTH_MODE.
+ * Resolves auth mode from the CONFIG_WIFI_PROV_AUTH_MODE_* choice.
  * On failure, recovers state to SCANNING and posts WIFI_MGR_EVENT_ERROR.
  *
  * Must be called from the manager task only.

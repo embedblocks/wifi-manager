@@ -59,6 +59,38 @@ uses the library defaults. Key knobs:
 See `03_configuration.md` for the full tuning guide, including the stack budget
 formula for `CONFIG_WIFI_SCAN_MAX_RESULTS`.
 
+## Choosing a provisioning auth mode (including headless devices)
+
+`CONFIG_WIFI_PROV_AUTH_MODE` (under **WiFi Manager** → *Provisioning security
+mode* in menuconfig) is a three-way choice:
+
+- **Open** — no PoP, no encryption. Bench testing only.
+- **Static PoP** — a fixed string baked into the firmware via
+  `CONFIG_WIFI_PROV_POP`. **This is the right choice for headless devices**
+  (no UART/console exposed to the operator): the PoP is known ahead of time
+  by whoever builds the firmware or operates the provisioning tooling, so
+  there's nothing that needs to be read off the device at provisioning time.
+- **MAC-derived** (default) — a per-device PoP derived from the device's own
+  MAC address, printed to the serial console when provisioning starts. Unique
+  per unit with zero extra configuration, but requires console access to read
+  the value, so it doesn't work for headless devices.
+
+To switch to static PoP, in `sdkconfig.defaults`:
+
+```
+CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP=y
+CONFIG_WIFI_PROV_POP="your-fixed-pop-here"
+```
+
+or via `idf.py menuconfig`. Treat the static PoP as a shared secret across
+every unit built from that firmware image, not a per-device credential —
+anyone with the value can provision any unit running it. If you need a true
+per-device secret without console access, that requires either a factory
+provisioning step that injects a unique value into NVS before deployment, or
+a custom `wifi_mgr_config_t`-level override (not currently exposed by this
+component — see the PoP resolution logic in `wifi_mgr_prov.c` if you need to
+extend it).
+
 ## Troubleshooting: binary too large for the factory partition
 
 If you see an error like:

@@ -139,33 +139,60 @@ esp_err_t wifi_mgr_prov_start(void)
     snprintf(CTX->prov_device_name, sizeof(CTX->prov_device_name),
              "%s%02X%02X%02X", prefix, mac[3], mac[4], mac[5]);
 
-    /* Resolve auth mode and PoP */
+    /* Resolve auth mode and PoP. Branches are compile-time (#if, not
+     * switch) since CONFIG_WIFI_PROV_AUTH_MODE is now a Kconfig choice —
+     * each option is its own bool symbol rather than one int value. */
     wifi_prov_security_t security;
     const char *pop = NULL;
+    const char *auth_str;
+    bool log_pop = false;
 
-    switch (CONFIG_WIFI_PROV_AUTH_MODE) {
-    case 0:
-        security = WIFI_PROV_SECURITY_0;
-        CTX->prov_pop[0] = '\0';
-        ESP_LOGI(TAG, "Provisioning: security=SECURITY_0 (no auth)");
-        break;
-    case 1:
-        security = WIFI_PROV_SECURITY_1;
-        strncpy(CTX->prov_pop, CONFIG_WIFI_PROV_POP, sizeof(CTX->prov_pop) - 1);
-        CTX->prov_pop[sizeof(CTX->prov_pop) - 1] = '\0';
-        pop = CTX->prov_pop;
-        ESP_LOGI(TAG, "Provisioning: security=SECURITY_1 static PoP");
-        break;
-    default: /* 2: SECURITY_1 with MAC-derived PoP */
-        security = WIFI_PROV_SECURITY_1;
-        snprintf(CTX->prov_pop, sizeof(CTX->prov_pop),
-                 "%02x%02x%02x%02x", mac[2], mac[3], mac[4], mac[5]);
-        pop = CTX->prov_pop;
-        ESP_LOGI(TAG, "Provisioning: security=SECURITY_1 MAC-derived PoP");
-        break;
+#if defined(CONFIG_WIFI_PROV_AUTH_MODE_OPEN)
+    security = WIFI_PROV_SECURITY_0;
+    CTX->prov_pop[0] = '\0';
+    auth_str = "Open (no security)";
+
+#elif defined(CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP)
+    security = WIFI_PROV_SECURITY_1;
+    strncpy(CTX->prov_pop, CONFIG_WIFI_PROV_POP, sizeof(CTX->prov_pop) - 1);
+    CTX->prov_pop[sizeof(CTX->prov_pop) - 1] = '\0';
+    pop = CTX->prov_pop;
+    auth_str = "SRP6a / static";
+    /* Not logged by default: the integrator already set this value in
+     * their own sdkconfig.defaults (that's the point of static mode for
+     * headless devices), so printing it to the console adds nothing and
+     * is needless exposure if logs are ever captured/uploaded. Flip this
+     * to true if you do want it echoed back for local bench debugging. */
+    log_pop = false;
+
+#else /* CONFIG_WIFI_PROV_AUTH_MODE_MAC_POP (default) */
+    security = WIFI_PROV_SECURITY_1;
+    snprintf(CTX->prov_pop, sizeof(CTX->prov_pop),
+             "%02x%02x%02x%02x", mac[2], mac[3], mac[4], mac[5]);
+    pop = CTX->prov_pop;
+    auth_str = "SRP6a / MAC-derived";
+    /* Must be logged: this is the only way the operator can learn a
+     * value that's unique per device and not known ahead of time. */
+    log_pop = true;
+#endif
+
+    /* Log to console — this is the component's only output responsibility.
+     * The operator reads this and enters the PoP into the provisioning
+     * app, or generates a QR code from it externally (e.g.
+     * https://espressif.github.io/esp-jumpstart/qrcode.html). */
+    ESP_LOGI(TAG, "-----------------------------------------");
+    ESP_LOGI(TAG, "BLE Provisioning started");
+    ESP_LOGI(TAG, "  Device Name : %s", CTX->prov_device_name);
+    ESP_LOGI(TAG, "  Auth Mode   : %s", auth_str);
+    if (security == WIFI_PROV_SECURITY_1) {
+        if (log_pop) {
+            ESP_LOGI(TAG, "  PoP         : %s", pop);
+        } else {
+            ESP_LOGI(TAG, "  PoP         : (static — set via CONFIG_WIFI_PROV_POP)");
+        }
     }
-
-    ESP_LOGI(TAG, "Provisioning device name: %s", CTX->prov_device_name);
+    ESP_LOGI(TAG, "  Transport   : BLE");
+    ESP_LOGI(TAG, "-----------------------------------------");
 
     /* Initialize provisioning manager */
     wifi_prov_mgr_config_t prov_cfg = {

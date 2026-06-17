@@ -13,12 +13,10 @@ idf_component_register(
     REQUIRES
         esp_wifi
         esp_event
-        freertos
         wifi_provisioning
         nvs_flash
         esp_netif
-        bt
- 
+        bt        
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wextra -Werror)

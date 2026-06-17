@@ -78,26 +78,64 @@ menu "WiFi Manager"
             to the next AP in the connect list. First attempt uses BSSID lock
             (if BSSID is stored); subsequent attempts use SSID-only.
 
-    config WIFI_PROV_AUTH_MODE
-        int "Provisioning security mode"
-        default 2
-        range 0 2
+    choice WIFI_PROV_AUTH_MODE
+        prompt "Provisioning security mode"
+        default WIFI_PROV_AUTH_MODE_MAC_POP
         help
-            0 = SECURITY_0 (no authentication)
-            1 = SECURITY_1 with static PoP string (CONFIG_WIFI_PROV_POP)
-            2 = SECURITY_1 with MAC-derived PoP (recommended)
+            Selects the protocomm security level and proof-of-possession
+            (PoP) source used during BLE provisioning. The PoP is what the
+            BLE Prov app / esp_prov script prompts the operator for before
+            it will accept WiFi credentials.
+
+        config WIFI_PROV_AUTH_MODE_OPEN
+            bool "Open — no authentication (SECURITY_0)"
+            help
+                No PoP, no encryption of provisioning traffic. Anyone
+                within BLE range can provision the device. Use only for
+                bench testing or trusted/shielded environments.
+
+        config WIFI_PROV_AUTH_MODE_STATIC_POP
+            bool "Static PoP, set via CONFIG_WIFI_PROV_POP (SECURITY_1)"
+            help
+                Use a fixed PoP string compiled into every unit, set below
+                via CONFIG_WIFI_PROV_POP. This is the right choice for
+                headless devices: there is no console to read a
+                MAC-derived PoP from, so the integrator chooses (and
+                distributes to installers/provisioning tooling) a known
+                value ahead of time instead.
+
+                Same PoP on every unit of a given firmware build — treat
+                it like a shared secret, not a per-device credential.
+
+        config WIFI_PROV_AUTH_MODE_MAC_POP
+            bool "MAC-derived PoP, logged to console (SECURITY_1, recommended)"
+            help
+                PoP is derived from the device's own MAC address and
+                printed to the serial console at provisioning start (see
+                wifi_mgr_prov.c). Unique per device with zero extra
+                configuration, but requires the operator to have console
+                access to read the value — not suitable for headless
+                devices with no exposed UART/log output.
+    endchoice
 
     config WIFI_PROV_POP
         string "Provisioning proof-of-possession (PoP) string"
         default "abcd1234"
         help
-            Static PoP for SECURITY_1_STATIC mode (CONFIG_WIFI_PROV_AUTH_MODE=1).
-            Ignored for SECURITY_0 and SECURITY_1_MAC modes.
+            Static PoP used when CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP is
+            selected above. Ignored (but still compiled in) for the Open
+            and MAC-derived modes.
 
-            NOTE: deliberately NOT gated with "depends on" — the auth mode
-            switch in wifi_mgr_prov.c is a runtime decision, so this symbol
-            must always be #define'd or the build fails whenever
-            CONFIG_WIFI_PROV_AUTH_MODE is not 1.
+            For headless devices: set this in your project's
+            sdkconfig.defaults to a value known ahead of time by whatever
+            tooling or installers will provision units in the field, e.g.
+                CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP=y
+                CONFIG_WIFI_PROV_POP="your-fixed-pop-here"
+
+            Kept unconditional (no "depends on") so it is always available
+            to read at runtime regardless of which mode is active —
+            simpler than gating it and risking an undefined symbol if the
+            mode is switched without also touching this value.
 
     config WIFI_PROV_DEVICE_NAME_PREFIX
         string "BLE device name prefix for provisioning"

@@ -24,8 +24,8 @@
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_log.h"
-#include "lwip/ip4_addr.h"
 #include "wifi_manager.h"
+#include "lwip/ip4_addr.h"
 
 static const char *TAG = "EXAMPLE";
 

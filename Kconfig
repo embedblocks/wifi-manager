@@ -1,0 +1,149 @@
+menu "WiFi Manager"
+
+    config MAX_AP_COUNT
+        int "Maximum stored AP credentials"
+        default 5
+        range 1 20
+        help
+            Capacity of the credential store (ap_records). Conceptually
+            owned by the ap_records module rather than wifi_manager proper
+            (see 03_configuration.md), but exposed here because ap_records
+            is vendored directly into this component's src/ directory
+            rather than built as a separate IDF component with its own
+            Kconfig.
+
+            Must satisfy CONFIG_WIFI_SCAN_MAX_RESULTS >= CONFIG_MAX_AP_COUNT
+            (enforced by a _Static_assert at build time) or stored
+            credentials may be silently skipped during scan matching.
+
+            Raising this value increases wifi_mgr task stack usage — see
+            CONFIG_WIFI_TASK_STACK_SIZE help text and the stack budget
+            table in 03_configuration.md.
+
+    config WIFI_KNOWN_AP_WAIT_MS
+        int "Time window (tw) duration in milliseconds"
+        default 120000
+        range 5000 300000
+        help
+            Hard deadline from first live AP detection to BLE provisioning start.
+            All scan cycles and connection attempts must complete within this window.
+            Formula for minimum safe value:
+            tw >= MAX_AP_COUNT * MAX_CONNECT_ATTEMPTS * CONNECT_TIMEOUT_MS
+            At defaults (5 * 3 * 8000 = 120000 ms). Increase for environments
+            with many stored APs, slow WPA2-Enterprise auth, or high-latency APs.
+
+    config WIFI_INTER_SCAN_DELAY_MS
+        int "Inter-scan delay in milliseconds"
+        default 3000
+        range 500 30000
+        help
+            Delay between end of scan result processing and next scan start.
+            Actual scan cadence = inter_scan_delay_ms + scan_duration (~2s).
+            At defaults: ~5s per cycle.
+
+    config WIFI_SCAN_MAX_RESULTS
+        int "Maximum scan results per cycle"
+        default 20
+        range 1 20
+        help
+            Cap on AP records fetched per scan cycle. APs beyond this cap are
+            silently dropped. Must satisfy two independent lower bounds:
+            (1) >= CONFIG_MAX_AP_COUNT (or stored credentials may be skipped)
+            (2) >= number of APs simultaneously visible in the densest deployment
+            environment (or stored APs with weaker signal may be crowded out).
+            See L2 in 01_overview.md.
+
+    config WIFI_SCAN_HIDDEN
+        bool "Scan for hidden SSIDs"
+        default n
+        help
+            Enable to include hidden networks in scan results.
+            Required for auto-reconnect to hidden SSIDs after provisioning.
+            See L1 in 01_overview.md.
+
+    config WIFI_CONNECT_TIMEOUT_MS
+        int "Per-AP connection attempt timeout in milliseconds"
+        default 8000
+        range 2000 30000
+        help
+            How long to wait for GOT_IP before considering a connection attempt
+            failed and moving to the next retry or next AP.
+
+    config WIFI_MAX_CONNECT_ATTEMPTS
+        int "Maximum connection attempts per AP"
+        default 3
+        range 1 10
+        help
+            Number of times to attempt connecting to each AP before advancing
+            to the next AP in the connect list. First attempt uses BSSID lock
+            (if BSSID is stored); subsequent attempts use SSID-only.
+
+    config WIFI_PROV_AUTH_MODE
+        int "Provisioning security mode"
+        default 2
+        range 0 2
+        help
+            0 = SECURITY_0 (no authentication)
+            1 = SECURITY_1 with static PoP string (CONFIG_WIFI_PROV_POP)
+            2 = SECURITY_1 with MAC-derived PoP (recommended)
+
+    config WIFI_PROV_POP
+        string "Provisioning proof-of-possession (PoP) string"
+        default "abcd1234"
+        help
+            Static PoP for SECURITY_1_STATIC mode (CONFIG_WIFI_PROV_AUTH_MODE=1).
+            Ignored for SECURITY_0 and SECURITY_1_MAC modes.
+
+            NOTE: deliberately NOT gated with "depends on" — the auth mode
+            switch in wifi_mgr_prov.c is a runtime decision, so this symbol
+            must always be #define'd or the build fails whenever
+            CONFIG_WIFI_PROV_AUTH_MODE is not 1.
+
+    config WIFI_PROV_DEVICE_NAME_PREFIX
+        string "BLE device name prefix for provisioning"
+        default "PROV_"
+        help
+            Prefix prepended to the MAC suffix to form the BLE advertisement
+            name. E.g. "PROV_" + "AABBCC" = "PROV_AABBCC".
+
+    config WIFI_PROV_TIMEOUT_MS
+        int "Provisioning session timeout in milliseconds (0 = no timeout)"
+        default 120000
+        range 0 600000
+        help
+            How long BLE provisioning can run before timing out and reverting
+            to SCANNING. Set to 0 to disable the timeout (provisioning runs
+            indefinitely until credentials are received or an error occurs).
+
+    config WIFI_TASK_STACK_SIZE
+        int "Manager task stack size in bytes"
+        default 6144
+        range 2048 16384
+        help
+            Stack size for the wifi_manager internal task.
+            Must be large enough to accommodate:
+            - scan buffer: CONFIG_WIFI_SCAN_MAX_RESULTS * 76 bytes
+            - two ap_info_t arrays: 2 * CONFIG_MAX_AP_COUNT * sizeof(ap_info_t)
+            - general function call overhead (~1KB)
+            At defaults (SCAN_MAX_RESULTS=20, MAX_AP_COUNT=5): ~2720B peak
+            inside wifi_mgr_scan_handle_results(), fits in 6144B with margin.
+            Raise proportionally when increasing SCAN_MAX_RESULTS or MAX_AP_COUNT.
+
+    config WIFI_TASK_PRIORITY
+        int "Manager task priority"
+        default 5
+        range 1 20
+        help
+            FreeRTOS priority for the wifi_manager internal task.
+
+    config WIFI_USE_COUNT_SAVE_INTERVAL
+        int "Use-count NVS save interval (connections between saves)"
+        default 5
+        range 1 100
+        help
+            ap_records_save() is called after every Nth successful connection
+            to throttle NVS write frequency. NVS writes block ~10-20ms.
+            Lower values persist use_count changes more frequently at the
+            cost of more frequent NVS writes. See L3 in 01_overview.md.
+
+endmenu

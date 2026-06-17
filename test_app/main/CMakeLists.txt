@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS
+        "main.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        unity
+        wifi_manager
+        ap_records_stub
+        wifi_event_stub
+        nvs_flash
+        esp_netif
+        esp_event
+)

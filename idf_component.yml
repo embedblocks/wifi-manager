@@ -1,0 +1,14 @@
+version: "0.1.0"
+description: >
+  WiFi lifecycle manager for ESP-IDF: scanning, credential-based reconnection,
+  and BLE provisioning. Other components observe it through an event interface
+  and never touch esp_wifi directly.
+dependencies:
+  idf: ">=5.1.0"
+targets:
+  - esp32
+  - esp32s3
+  - esp32c3
+  - esp32c6
+examples:
+  - path: examples/basic_provisioning

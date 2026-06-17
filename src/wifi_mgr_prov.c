@@ -26,6 +26,21 @@
 
 static const char *TAG = "wifi_mgr";
 
+/* Catch an oversized static PoP at compile time rather than silently
+ * truncating it at runtime (strncpy would otherwise cut it to fit, and
+ * the device would advertise a value that doesn't match what the
+ * operator typed into the provisioning app, with no way to tell why
+ * provisioning is failing). Always checked, even when MAC_POP or OPEN
+ * mode is active, since CONFIG_WIFI_PROV_POP is always #define'd (see
+ * its Kconfig help text) and switching modes shouldn't surface a
+ * latent length bug only when STATIC_POP is later enabled. */
+_Static_assert(
+    sizeof(CONFIG_WIFI_PROV_POP) - 1 < WIFI_MGR_PROV_POP_BUF_SIZE,
+    "CONFIG_WIFI_PROV_POP is too long and would be silently truncated. "
+    "Shorten the string in sdkconfig.defaults / menuconfig, or raise "
+    "WIFI_MGR_PROV_POP_BUF_SIZE in wifi_mgr_ctx.h to match."
+);
+
 /* ── prov_mgr_safe_deinit ────────────────────────────────────────────────── */
 
 /* Forward declaration for use in prov event handler */
@@ -154,6 +169,24 @@ esp_err_t wifi_mgr_prov_start(void)
 
 #elif defined(CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP)
     security = WIFI_PROV_SECURITY_1;
+    if (strlen(CONFIG_WIFI_PROV_POP) >= sizeof(CTX->prov_pop)) {
+        /* Should be unreachable — the _Static_assert above this function
+         * already catches this at compile time. Kept as defense in depth
+         * in case that guard is ever weakened independently of this
+         * runtime path in a future change. */
+        ESP_LOGE(TAG, "CONFIG_WIFI_PROV_POP (%d chars) exceeds buffer "
+                       "(%d chars) and would be truncated — refusing to "
+                       "start with a corrupted PoP. Shorten the string.",
+                 (int)strlen(CONFIG_WIFI_PROV_POP), (int)sizeof(CTX->prov_pop) - 1);
+        wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
+        wifi_mgr_error_info_t err_info = {
+            .code               = ESP_ERR_INVALID_SIZE,
+            .state              = WIFI_MGR_STATE_PROVISIONING,
+            .consecutive_errors = ++CTX->consecutive_errors,
+        };
+        wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err_info, sizeof(err_info));
+        return ESP_ERR_INVALID_SIZE;
+    }
     strncpy(CTX->prov_pop, CONFIG_WIFI_PROV_POP, sizeof(CTX->prov_pop) - 1);
     CTX->prov_pop[sizeof(CTX->prov_pop) - 1] = '\0';
     pop = CTX->prov_pop;

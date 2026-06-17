@@ -79,8 +79,22 @@ To switch to static PoP, in `sdkconfig.defaults`:
 
 ```
 CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP=y
-CONFIG_WIFI_PROV_POP="your-fixed-pop-here"
+CONFIG_WIFI_PROV_POP="CHANGEME-1234"
 ```
+
+**Replace `CHANGEME-1234` with your own value before flashing.** If you
+forget and the BLE Prov app reports a failure (handshake/auth error) even
+though you're typing in what you think is the right PoP, check that the
+value you're entering in the app actually matches what's compiled into
+`CONFIG_WIFI_PROV_POP` — a mismatch here is the single most common cause
+of static-mode provisioning failures, and it fails silently from the
+device's side (BLE auth just won't complete; there's no specific error
+message pointing at "wrong PoP").
+
+The string must be under 64 characters; an oversized value fails the
+*build* with a clear error (rather than being silently truncated, which
+used to be a real bug here) — see `WIFI_MGR_PROV_POP_BUF_SIZE` in
+`wifi_mgr_ctx.h` if you ever need to raise that limit.
 
 or via `idf.py menuconfig`. Treat the static PoP as a shared secret across
 every unit built from that firmware image, not a per-device credential —

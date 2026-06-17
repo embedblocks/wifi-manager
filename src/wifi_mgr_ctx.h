@@ -104,6 +104,12 @@ _Static_assert(
     "skipped on every scan. See L2 in 01_overview.md."
 );
 
+/* Sized for human-chosen static PoP strings (CONFIG_WIFI_PROV_POP), not
+ * just the 8-hex-char MAC-derived case. wifi_mgr_prov.c enforces this
+ * bound at compile time via _Static_assert against CONFIG_WIFI_PROV_POP's
+ * length — keep both in sync if you change this. */
+#define WIFI_MGR_PROV_POP_BUF_SIZE 64
+
 /* ── Context struct ──────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -131,7 +137,7 @@ typedef struct {
 
     /* Provisioning */
     char  prov_device_name[32];
-    char  prov_pop[16];
+    char  prov_pop[WIFI_MGR_PROV_POP_BUF_SIZE];
     bool  prov_mgr_initialized;     /**< Guards prov_mgr_safe_deinit idempotency */
 
     /* Connect list — populated by wifi_mgr_scan_handle_results() */

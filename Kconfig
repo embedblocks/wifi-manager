@@ -130,7 +130,14 @@ menu "WiFi Manager"
             sdkconfig.defaults to a value known ahead of time by whatever
             tooling or installers will provision units in the field, e.g.
                 CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP=y
-                CONFIG_WIFI_PROV_POP="your-fixed-pop-here"
+                CONFIG_WIFI_PROV_POP="CHANGEME-1234"
+            replacing CHANGEME-1234 with your own value before flashing —
+            do not ship the placeholder as-is.
+
+            Must be under WIFI_MGR_PROV_POP_BUF_SIZE (64) characters; this
+            is enforced by a _Static_assert in wifi_mgr_prov.c, so an
+            oversized value fails the build rather than being silently
+            truncated.
 
             Kept unconditional (no "depends on") so it is always available
             to read at runtime regardless of which mode is active —

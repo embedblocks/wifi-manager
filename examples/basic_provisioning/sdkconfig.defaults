@@ -20,7 +20,12 @@ CONFIG_WIFI_PROV_AUTH_MODE_MAC_POP=y
 # from): use a fixed PoP known ahead of time instead. Uncomment these two
 # lines and comment out the MAC_POP line above:
 #   CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP=y
-#   CONFIG_WIFI_PROV_POP="your-fixed-pop-here"
+#   CONFIG_WIFI_PROV_POP="CHANGEME-1234"
+#                          ^^^^^^^^ placeholder — pick your own value
+#                          before flashing. If you skip this step and
+#                          provisioning fails, this is almost certainly
+#                          why: you typed a different PoP into the app
+#                          than what's actually compiled into the device.
 CONFIG_WIFI_PROV_TIMEOUT_MS=300000
 CONFIG_WIFI_PROV_DEVICE_NAME_PREFIX="PROV_"
 

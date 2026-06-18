@@ -20,6 +20,17 @@ CONFIG_WIFI_SCAN_HIDDEN=n
 CONFIG_WIFI_PROV_AUTH_MODE_MAC_POP=y
 CONFIG_WIFI_PROV_TIMEOUT_MS=30000
 CONFIG_WIFI_PROV_DEVICE_NAME_PREFIX="TEST_"
+# KEEP_ALIVE is the component default; left as-is here since neither
+# policy's success-path behavior is exercised by stubbed BLE — the BT
+# host stack is linked (see note below) but real provisioning success
+# isn't reachable through the WiFi-driver stubs alone.
+CONFIG_WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE=y
+# Fast like the other test timings above — only matters for the one
+# test case exercising the synchronous-start-failure backoff guard
+# (see test_wifi_mgr_prov.c); no reason to wait the production default
+# of 2000ms in a test run. 500 is the Kconfig-enforced floor
+# (range 500 30000 in the component's Kconfig).
+CONFIG_WIFI_PROV_BLE_RETRY_BACKOFF_MS=500
 
 # -----------------------------------------------------------------------
 # BLE / Bluetooth

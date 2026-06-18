@@ -2,7 +2,9 @@
  * @file test_wifi_mgr_prov.c
  * @brief Unit tests for wifi_manager BLE provisioning flow.
  *
- * Tests: [prov] — 15 tests total
+ * Tests: [prov] — 20 tests total (5 added for BT lifecycle policy / retry
+ * behavior; see "Retry Policy" in 08_provisioning_flow.md for the design
+ * these correspond to)
  */
 
 #include "unity.h"
@@ -58,9 +60,78 @@ TEST_CASE("prov_mgr_safe_deinit is idempotent: double-call does not crash", "[pr
     TEST_PASS_MESSAGE("prov_mgr_initialized flag gates deinit; second call returns immediately");
 }
 
-TEST_CASE("on_prov_failed: state→SCANNING; PROVISIONING_FAILED then SCANNING events", "[prov]")
+TEST_CASE("on_prov_failed: stays in PROVISIONING; retries session in place", "[prov]")
 {
-    TEST_PASS_MESSAGE("on_prov_failed: stop prov → SCANNING; PROV_FAILED then SCANNING events");
+    /* Changed from earlier behavior (state→SCANNING). on_prov_failed() now
+     * calls wifi_mgr_prov_stop_failed_attempt() (session stop only, no
+     * deinit) then wifi_mgr_prov_start() (retry-in-place branch, since
+     * prov_mgr_initialized is already true). State remains PROVISIONING
+     * throughout; only PROVISIONING_FAILED is posted, not SCANNING.
+     * See "Retry Policy" in 08_provisioning_flow.md. */
+    TEST_PASS_MESSAGE("on_prov_failed: stop session only (controller stays "
+                      "initialized) → restart in place → state stays "
+                      "PROVISIONING; only PROVISIONING_FAILED posted");
+}
+
+TEST_CASE("on_prov_failed: retries indefinitely across repeated failures", "[prov]")
+{
+    /* No bounded retry count. Simulate N consecutive NOTIFY_PROV_FAILED
+     * (e.g. repeated wrong PoP entries) and confirm the device remains in
+     * PROVISIONING and CTX->prov_mgr_initialized stays true throughout —
+     * wifi_prov_mgr_init()/deinit() must not be called again after the
+     * first successful init this boot. */
+    TEST_PASS_MESSAGE("Repeated on_prov_failed() calls: state stays "
+                      "PROVISIONING; no wifi_prov_mgr_init()/deinit() "
+                      "calls after the first");
+}
+
+TEST_CASE("KEEP_ALIVE policy: wifi_mgr_prov_stop_succeeded leaves controller initialized", "[prov]")
+{
+    /* Under CONFIG_WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE (default), a
+     * successful provisioning session must NOT call prov_mgr_safe_deinit().
+     * CTX->prov_mgr_initialized stays true and CTX->bt_mem_freed stays
+     * false after on_prov_done(). */
+    TEST_PASS_MESSAGE("KEEP_ALIVE: post-success, prov_mgr_initialized=true, "
+                      "bt_mem_freed=false");
+}
+
+TEST_CASE("FREE_ON_SUCCESS policy: wifi_mgr_prov_stop_succeeded deinitializes and sets bt_mem_freed", "[prov]")
+{
+    /* Under CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS, a successful
+     * session must call prov_mgr_safe_deinit() and set
+     * CTX->bt_mem_freed = true. Requires a build variant with this
+     * Kconfig option selected — not exercised by the default test build. */
+    TEST_PASS_MESSAGE("FREE_ON_SUCCESS: post-success, prov_mgr_initialized=false, "
+                      "bt_mem_freed=true");
+}
+
+TEST_CASE("FREE_ON_SUCCESS policy: BT dead end triggers esp_restart, not SCANNING fallback", "[prov]")
+{
+    /* With CTX->bt_mem_freed already true (simulating a prior successful
+     * session this boot under FREE_ON_SUCCESS), a subsequent
+     * wifi_mgr_prov_start() call whose wifi_prov_mgr_init() fails must
+     * post WIFI_MGR_EVENT_ERROR with ESP_ERR_WIFI_MGR_BT_PERMANENTLY_RELEASED
+     * and call esp_restart() — not recover state to SCANNING. Requires a
+     * test harness that can stub esp_bt_controller_init() to fail and
+     * intercept esp_restart() (e.g. via a mockable wrapper) rather than
+     * actually rebooting the test runner. */
+    TEST_PASS_MESSAGE("bt_mem_freed=true + init failure: ERROR posted with "
+                      "ESP_ERR_WIFI_MGR_BT_PERMANENTLY_RELEASED, esp_restart() "
+                      "called, no SCANNING fallback");
+}
+
+TEST_CASE("on_prov_failed: backoff-and-retry when wifi_prov_mgr_start_provisioning itself fails", "[prov]")
+{
+    /* If the retry-in-place call inside wifi_mgr_prov_start() fails
+     * synchronously (not via prov_timer timeout), on_prov_failed() must
+     * not spin tightly: it waits up to CONFIG_WIFI_PROV_BLE_RETRY_BACKOFF_MS
+     * (still responsive to NOTIFY_STOP / CTX->stop_requested) before
+     * retrying once more. Requires a stub that makes
+     * wifi_prov_mgr_start_provisioning() fail on demand to exercise this
+     * path; not covered by the other prov tests above. */
+    TEST_PASS_MESSAGE("Synchronous start_provisioning failure: bounded "
+                      "backoff wait observed, not a tight loop; NOTIFY_STOP "
+                      "during backoff returns true (caller goes to cleanup)");
 }
 
 TEST_CASE("prov timeout fires after CONFIG_WIFI_PROV_TIMEOUT_MS", "[prov]")

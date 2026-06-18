@@ -4,11 +4,37 @@
  *
  * See 08_provisioning_flow.md and implementation plan Phase 5 for details.
  *
- * Race condition fix (from 08_provisioning_flow.md):
- * WIFI_PROV_END is a no-op. All deinit happens via prov_mgr_safe_deinit()
- * called from exactly three call sites: on_prov_done(), on_prov_failed(),
- * and wifi_mgr_prov_stop(). Calling deinit from PROV_END handler causes
- * a double-free race when PROV_END fires before CRED_SUCCESS is processed.
+ * Race condition fix #1 (from 08_provisioning_flow.md):
+ * WIFI_PROV_END is a no-op. Deinit happens only via prov_mgr_safe_deinit(),
+ * which is now called from exactly two sites: wifi_mgr_prov_stop_succeeded()
+ * (conditionally, under CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS) and
+ * wifi_mgr_prov_stop_shutdown() (always, unconditionally). It is
+ * deliberately NOT called from wifi_mgr_prov_stop_failed_attempt() — see
+ * fix #2 below. Calling deinit from the PROV_END handler would race when
+ * PROV_END fires before CRED_SUCCESS is processed.
+ *
+ * Fix #2 (BT controller cannot be reinitialized after deinit — the actual
+ * root cause of the original "BLE_INIT: controller init failed" field
+ * bug): esp_bt_controller_init() is documented by Espressif as
+ * unsupported after a prior esp_bt_controller_deinit() in the same boot.
+ * wifi_prov_mgr_deinit() triggers exactly that deinit as a side effect of
+ * the WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM scheme handler used
+ * here. Once that has happened, no amount of waiting or retrying makes a
+ * later wifi_prov_mgr_init() succeed — it is a hard wall, not a
+ * transient race against an async teardown task (an earlier diagnosis
+ * assumed wifi_prov_mgr_stop_provisioning() returns before BLE teardown
+ * completes; in fact it runs in its default blocking mode in this
+ * codebase — wifi_prov_mgr_disable_auto_stop() is never called — so it
+ * already waits for the session to fully stop before returning).
+ *
+ * The fix is to avoid the deinit/reinit cycle entirely on the
+ * failure-retry path: wifi_mgr_prov_stop_failed_attempt() never
+ * deinitializes, so wifi_mgr_prov_start()'s retry-in-place branch can
+ * restart the existing session directly, indefinitely, without ever
+ * exercising esp_bt_controller_deinit()/init() again. See
+ * CTX->bt_mem_freed and CONFIG_WIFI_PROV_BT_LIFECYCLE in Kconfig for how
+ * this interacts with the *success* path, where deinit (to free BT
+ * memory) is sometimes still desired despite the one-way cost.
  */
 
 #include "wifi_mgr_prov.h"
@@ -106,9 +132,11 @@ static void wifi_mgr_prov_event_handler(void *arg,
     }
 
     case WIFI_PROV_END:
-        /* Intentional no-op. All deinit is via prov_mgr_safe_deinit()
-         * from on_prov_done() / on_prov_failed() / wifi_mgr_prov_stop().
-         * Calling deinit here would race with CRED_SUCCESS processing. */
+        /* Intentional no-op. All deinit is via prov_mgr_safe_deinit(),
+         * called only from wifi_mgr_prov_stop_succeeded() (conditionally)
+         * and wifi_mgr_prov_stop_shutdown() (always) — never from
+         * wifi_mgr_prov_stop_failed_attempt(). Calling deinit here would
+         * race with CRED_SUCCESS processing. */
         ESP_LOGD(TAG, "WIFI_PROV_END received (no-op)");
         break;
 
@@ -123,8 +151,10 @@ static void wifi_mgr_prov_event_handler(void *arg,
  * @brief Idempotent provisioning manager cleanup.
  *
  * Guards against double-deinit via CTX->prov_mgr_initialized.
- * Called from exactly three sites: on_prov_done(), on_prov_failed(),
- * and wifi_mgr_prov_stop().
+ * Called from exactly two sites: wifi_mgr_prov_stop_succeeded()
+ * (conditionally) and wifi_mgr_prov_stop_shutdown() (always).
+ * Deliberately NOT called from wifi_mgr_prov_stop_failed_attempt() —
+ * see file header comment, fix #2.
  */
 static void prov_mgr_safe_deinit(void)
 {
@@ -142,6 +172,45 @@ static void prov_mgr_safe_deinit(void)
 
 esp_err_t wifi_mgr_prov_start(void)
 {
+    /* Retry-in-place: if a session already exists (survived a prior
+     * failure/timeout without being deinitialized — see
+     * prov_mgr_stop_failed_attempt() below), skip straight to
+     * (re)starting the session rather than re-running wifi_prov_mgr_init().
+     * This is what makes failed/timed-out attempts retry indefinitely
+     * without ever touching the controller deinit/reinit cycle that
+     * triggers the documented ESP-IDF wall (esp_bt_controller_init() is
+     * not supported after a prior esp_bt_controller_deinit() in the same
+     * boot). Device name / PoP were already set on the first call and do
+     * not change between retries, so they are not recomputed here. */
+    if (CTX->prov_mgr_initialized) {
+        esp_err_t ret = wifi_prov_mgr_start_provisioning(
+            CTX->prov_security, CTX->prov_pop[0] != '\0' ? CTX->prov_pop : NULL,
+            CTX->prov_device_name, NULL);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "wifi_prov_mgr_start_provisioning (retry) failed: %s",
+                     esp_err_to_name(ret));
+            wifi_mgr_error_info_t err_info = {
+                .code               = ret,
+                .state              = WIFI_MGR_STATE_PROVISIONING,
+                .consecutive_errors = ++CTX->consecutive_errors,
+            };
+            wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err_info, sizeof(err_info));
+            /* Do NOT fall back to SCANNING — stay in PROVISIONING and let
+             * the caller (on_prov_failed(), via the prov_timer or another
+             * NOTIFY_PROV_FAILED) try again. The session is still alive;
+             * a transient start failure here is not the BT dead end
+             * (that can only be hit via wifi_prov_mgr_init(), below). */
+            return ret;
+        }
+        if (CTX->config.prov_timeout_ms > 0) {
+            xTimerStart(CTX->prov_timer, 0);
+        }
+        wifi_mgr_events_post(WIFI_MGR_EVENT_PROVISIONING_STARTED, NULL, 0);
+        ESP_LOGI(TAG, "BLE provisioning restarted in place (timeout: %"PRIu32" ms)",
+                 CTX->config.prov_timeout_ms);
+        return ESP_OK;
+    }
+
     /* Read the stable eFuse MAC — use esp_read_mac() not esp_wifi_get_mac()
      * to bypass MAC randomization and always get the hardware address. */
     uint8_t mac[6];
@@ -209,6 +278,9 @@ esp_err_t wifi_mgr_prov_start(void)
     log_pop = true;
 #endif
 
+    /* Stash security mode for use on retry-in-place above. */
+    CTX->prov_security = security;
+
     /* Log to console — this is the component's only output responsibility.
      * The operator reads this and enters the PoP into the provisioning
      * app, or generates a QR code from it externally (e.g.
@@ -236,7 +308,35 @@ esp_err_t wifi_mgr_prov_start(void)
     esp_err_t ret = wifi_prov_mgr_init(prov_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "wifi_prov_mgr_init failed: %s", esp_err_to_name(ret));
-        /* Recover to SCANNING */
+
+        if (CTX->bt_mem_freed) {
+            /* The dead end: BT memory was released after a prior
+             * successful FREE_ON_SUCCESS session, and esp_bt_controller_init()
+             * does not support being called again in the same boot
+             * (documented ESP-IDF limitation, not a transient fault — see
+             * WIFI_PROV_BT_LIFECYCLE in Kconfig). Retrying this call would
+             * fail identically forever. Restart instead of falling back
+             * to SCANNING, so the device comes back up with the
+             * controller available and walks the normal boot path back
+             * into PROVISIONING. */
+            ESP_LOGE(TAG, "BLE controller unavailable after prior BT memory "
+                          "release (CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS) "
+                          "— this cannot be retried in this boot. Restarting "
+                          "to recover.");
+            wifi_mgr_error_info_t err_info = {
+                .code               = ESP_ERR_WIFI_MGR_BT_PERMANENTLY_RELEASED,
+                .state              = WIFI_MGR_STATE_PROVISIONING,
+                .consecutive_errors = ++CTX->consecutive_errors,
+            };
+            wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err_info, sizeof(err_info));
+            esp_restart();
+            /* esp_restart() does not return. */
+        }
+
+        /* Not the dead end — an ordinary init failure (e.g. transient
+         * resource pressure on first-ever provisioning attempt). Recover
+         * to SCANNING as before; the existing consecutive-error backoff
+         * in 09_event_system.md governs the retry cadence from there. */
         wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
         wifi_mgr_error_info_t err_info = {
             .code               = ret,
@@ -290,10 +390,54 @@ esp_err_t wifi_mgr_prov_start(void)
     return ESP_OK;
 }
 
-void wifi_mgr_prov_stop(void)
+
+void wifi_mgr_prov_stop_failed_attempt(void)
 {
     xTimerStop(CTX->prov_timer, 0);
     wifi_prov_mgr_stop_provisioning();
+
+    /* Deliberately do NOT call prov_mgr_safe_deinit() here. Leaving the
+     * session (and the BLE controller) initialized is what allows
+     * wifi_mgr_prov_start()'s retry-in-place branch to restart the
+     * session directly next call, without ever exercising the
+     * esp_bt_controller_deinit()-then-init() cycle that fails on
+     * ESP-IDF (see file header comment, race condition fix #2, and
+     * WIFI_PROV_BT_LIFECYCLE in Kconfig). This applies under both
+     * WIFI_PROV_BT_LIFECYCLE policies — the policies differ only in
+     * what happens after a *successful* session (see
+     * wifi_mgr_prov_stop_succeeded() below), not after a failure. */
+    ESP_LOGD(TAG, "Provisioning attempt stopped (session kept alive for retry)");
+}
+
+void wifi_mgr_prov_stop_succeeded(void)
+{
+    xTimerStop(CTX->prov_timer, 0);
+    wifi_prov_mgr_stop_provisioning();
+
+#if defined(CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS)
     prov_mgr_safe_deinit();
-    ESP_LOGD(TAG, "Provisioning stopped");
+    CTX->bt_mem_freed = true;
+    ESP_LOGI(TAG, "Provisioning succeeded — BLE controller deinitialized and "
+                  "BT memory released (CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS). "
+                  "Re-entering BLE provisioning in this boot will require a restart.");
+#else /* CONFIG_WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE (default) */
+    /* Deliberately left initialized. See WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE
+     * help text in Kconfig: keeps BT memory reserved so this boot can
+     * re-enter BLE provisioning later (credential revocation, factory
+     * reset button) with no restart required. */
+    ESP_LOGD(TAG, "Provisioning succeeded — BLE controller left initialized "
+                  "(CONFIG_WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE)");
+#endif
+}
+
+void wifi_mgr_prov_stop_shutdown(void)
+{
+    /* Called only from wifi_mgr_stop() — the manager is being torn down
+     * entirely, not retried. Always fully deinitialize regardless of
+     * WIFI_PROV_BT_LIFECYCLE policy or CTX->prov_mgr_initialized state;
+     * there is no "next attempt" to keep the controller alive for. */
+    xTimerStop(CTX->prov_timer, 0);
+    wifi_prov_mgr_stop_provisioning();
+    prov_mgr_safe_deinit();
+    ESP_LOGD(TAG, "Provisioning stopped (manager shutdown)");
 }

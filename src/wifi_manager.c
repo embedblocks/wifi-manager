@@ -294,7 +294,7 @@ static void on_disconnect(void)
  */
 static void on_prov_done(void)
 {
-    wifi_mgr_prov_stop();
+    wifi_mgr_prov_stop_succeeded();
 
     if (CTX->pending_nvs_save) {
         esp_err_t ret = ap_records_save();
@@ -323,19 +323,94 @@ static void on_prov_done(void)
 }
 
 /**
- * @brief Handle provisioning failure or timeout. Returns to SCANNING.
+ * @brief Handle provisioning failure or timeout. Retries in place.
+ *
+ * Does NOT revert to SCANNING. The BLE session is stopped (via
+ * wifi_mgr_prov_stop_failed_attempt(), which deliberately does not
+ * deinitialize wifi_prov_mgr or the BLE controller — see
+ * wifi_mgr_prov.h) and immediately restarted via wifi_mgr_prov_start(),
+ * which detects the already-initialized session and restarts it in
+ * place. This retries indefinitely until credentials are received
+ * successfully or the device is power-cycled — there is no bounded
+ * retry count and no escalation to SCANNING for this failure mode,
+ * by design (see CONFIG_WIFI_PROV_BT_LIFECYCLE in Kconfig for why:
+ * reverting to SCANNING would eventually require re-entering
+ * PROVISIONING via the tw timer, which would hit the documented
+ * esp_bt_controller_init()-after-deinit wall on FREE_ON_SUCCESS, or be
+ * pointless churn on KEEP_ALIVE since the session is already alive).
+ *
+ * wifi_mgr_prov_start() can still itself fail or trigger esp_restart()
+ * (the CTX->bt_mem_freed dead-end case) — those are handled inside
+ * wifi_mgr_prov_start() itself, not here.
+ *
+ * @return true if a stop was detected during the retry backoff wait and
+ *         the caller (the PROVISIONING case in the manager task's
+ *         dispatch loop) must `goto cleanup` immediately, exactly as it
+ *         already does on its own direct NOTIFY_STOP checks. false in
+ *         every other case (including the common path where no backoff
+ *         wait was needed at all).
  */
-static void on_prov_failed(void)
+static bool on_prov_failed(void)
 {
-    /* wifi_mgr_prov_stop() stops prov_timer and calls
-     * wifi_prov_mgr_stop_provisioning() internally; see wifi_mgr_prov.c. */
-    wifi_mgr_prov_stop();
+    wifi_mgr_prov_stop_failed_attempt();
 
-    wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
     wifi_mgr_events_post(WIFI_MGR_EVENT_PROVISIONING_FAILED, NULL, 0);
-    wifi_mgr_events_post(WIFI_MGR_EVENT_SCANNING, NULL, 0);
+    ESP_LOGW(TAG, "Provisioning attempt failed or timed out — retrying "
+                  "(staying in PROVISIONING)");
 
-    ESP_LOGW(TAG, "Provisioning failed or timed out — returning to SCANNING");
+    /* State remains WIFI_MGR_STATE_PROVISIONING throughout — only the
+     * underlying BLE session is restarted, not the state machine state. */
+    esp_err_t ret = wifi_mgr_prov_start();
+    if (ret != ESP_OK) {
+        /* wifi_mgr_prov_start() already logged and posted ERROR (and, in
+         * the bt_mem_freed dead-end case, already called esp_restart()
+         * and will not return at all — this line is then unreachable).
+         *
+         * If it did return, this call went through the retry-in-place
+         * branch (CTX->prov_mgr_initialized was already true — every
+         * call to wifi_mgr_prov_start() from inside on_prov_failed() does,
+         * since on_prov_failed() is only reachable after PROVISIONING was
+         * already entered once). That branch deliberately does NOT
+         * recover state to SCANNING on failure (see wifi_mgr_prov.c) — so
+         * unlike a cold-init failure at first entry into PROVISIONING,
+         * state is still PROVISIONING here.
+         *
+         * Guard against a tight retry loop: if
+         * wifi_prov_mgr_start_provisioning() itself fails synchronously
+         * and immediately (rather than via the normal prov_timer
+         * timeout), nothing else throttles the next attempt — the prov
+         * event handler never fired, so no NOTIFY_PROV_FAILED is coming
+         * on its own. Wait out CTX->config.ble_retry_backoff_ms here
+         * (CONFIG_WIFI_PROV_BLE_RETRY_BACKOFF_MS by default — deliberately
+         * not inter_scan_delay_ms; see that Kconfig entry's help text for
+         * why these two delays are kept separate), still responsive to
+         * NOTIFY_STOP, then retry once more. */
+        ESP_LOGE(TAG, "Failed to restart provisioning after failure: %s — "
+                      "backing off before next attempt", esp_err_to_name(ret));
+        uint32_t notif = 0;
+        xTaskNotifyWait(0, UINT32_MAX, &notif,
+                        pdMS_TO_TICKS(CTX->config.ble_retry_backoff_ms));
+        if ((notif & NOTIFY_STOP) || CTX->stop_requested) {
+            /* Tell the caller to goto cleanup directly — same as every
+             * other NOTIFY_STOP check in the dispatch loop. No bit
+             * re-posting needed: the bit we just consumed is reflected
+             * in this return value instead. CTX->stop_requested is
+             * checked in addition to the notif bit because
+             * wifi_mgr_stop() sets it synchronously before NOTIFY_STOP
+             * is ever sent (see wifi_mgr_stop()) — checking it here
+             * catches a stop already in progress even if the
+             * notification bit itself hasn't arrived in this exact
+             * xTaskNotifyWait call. */
+            return true;
+        }
+        ret = wifi_mgr_prov_start();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Provisioning restart still failing after backoff: "
+                          "%s — will retry on next NOTIFY_PROV_FAILED",
+                     esp_err_to_name(ret));
+        }
+    }
+    return false;
 }
 
 /* ── tw_expired handler ──────────────────────────────────────────────────── */
@@ -687,7 +762,7 @@ static void manager_task(void *arg)
             xTaskNotifyWait(0, UINT32_MAX, &notif, portMAX_DELAY);
             if (notif & NOTIFY_STOP)        goto cleanup;
             if (notif & NOTIFY_PROV_DONE)   { on_prov_done();   continue; }
-            if (notif & NOTIFY_PROV_FAILED) { on_prov_failed(); continue; }
+            if (notif & NOTIFY_PROV_FAILED) { if (on_prov_failed()) goto cleanup; continue; }
             /* NOTIFY_CONNECTED and NOTIFY_DISCONNECTED are silently discarded
              * in PROVISIONING state. wifi_prov_mgr owns the WiFi stack.
              * Acting on CONNECTED would call on_connect_success() with an
@@ -740,6 +815,8 @@ esp_err_t wifi_mgr_init(const wifi_mgr_config_t *config)
         CTX->config.connect_timeout_ms = CONFIG_WIFI_CONNECT_TIMEOUT_MS;
     if (CTX->config.prov_timeout_ms == 0)
         CTX->config.prov_timeout_ms = CONFIG_WIFI_PROV_TIMEOUT_MS;
+    if (CTX->config.ble_retry_backoff_ms == 0)
+        CTX->config.ble_retry_backoff_ms = CONFIG_WIFI_PROV_BLE_RETRY_BACKOFF_MS;
     if (CTX->config.max_connect_attempts == 0)
         CTX->config.max_connect_attempts = CONFIG_WIFI_MAX_CONNECT_ATTEMPTS;
     if (CTX->config.use_count_save_interval == 0)
@@ -924,7 +1001,7 @@ esp_err_t wifi_mgr_stop(void)
 
     /* Step 2: stop provisioning if active */
     if (wifi_mgr_state_get() == WIFI_MGR_STATE_PROVISIONING) {
-        wifi_mgr_prov_stop();
+        wifi_mgr_prov_stop_shutdown();
     }
 
     /* Step 3: stop any in-progress scan unconditionally */

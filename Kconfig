@@ -156,9 +156,129 @@ menu "WiFi Manager"
         default 120000
         range 0 600000
         help
-            How long BLE provisioning can run before timing out and reverting
-            to SCANNING. Set to 0 to disable the timeout (provisioning runs
-            indefinitely until credentials are received or an error occurs).
+            How long a single BLE provisioning session (one advertise/connect
+            attempt by the operator) can run before that attempt is
+            considered failed. On expiry, provisioning restarts immediately
+            for another attempt — it does NOT revert to SCANNING. The
+            device stays in PROVISIONING and keeps retrying indefinitely
+            until credentials are received successfully, or the operator
+            power-cycles the device. Set to 0 to disable the per-session
+            timeout entirely (a single session then runs forever until
+            credentials are received or a hard error occurs).
+
+            This changed from earlier versions of this component, which
+            reverted to SCANNING on timeout. See WIFI_PROV_BT_LIFECYCLE
+            below for why: re-entering PROVISIONING from SCANNING would
+            require tearing down and re-initializing the BLE controller,
+            which is not reliably supported by the underlying esp_bt
+            controller layer (esp_bt_controller_init() is documented by
+            Espressif as unsupported after a prior esp_bt_controller_deinit()
+            in the same boot). Retrying the existing session in place avoids
+            that controller teardown/reinit cycle altogether.
+
+    choice WIFI_PROV_BT_LIFECYCLE
+        prompt "BLE controller lifecycle policy"
+        default WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE
+        help
+            Controls what happens to the BLE controller and the
+            wifi_prov_mgr instance after provisioning, and governs how
+            failed/timed-out provisioning attempts are retried.
+
+            Background: esp_bt_controller_deinit() is documented by
+            Espressif as not fully reversible within a single boot —
+            esp_bt_controller_init() is not supported after a prior
+            deinit. Calling wifi_prov_mgr_deinit() with the
+            WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM scheme handler
+            (used by this component) triggers exactly that deinit as a
+            side effect. So once BT memory has been freed in a given
+            boot, a later attempt to re-enter BLE provisioning in the
+            same boot will fail at esp_bt_controller_init() every time —
+            this is a hard wall, not a transient fault.
+
+            Provisioning *failures and timeouts* are handled identically
+            under both policies below: the existing wifi_prov_mgr session
+            is never torn down on failure, only restarted in place
+            (wifi_prov_mgr_start_provisioning() called again without an
+            intervening init/deinit cycle), so failed attempts retry
+            indefinitely without ever touching the controller
+            teardown/reinit path that triggers the wall above. The two
+            policies differ only in what happens after a *successful*
+            provisioning session completes.
+
+        config WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE
+            bool "Keep BLE controller initialized after success (recommended default)"
+            help
+                On successful provisioning, wifi_prov_mgr and the BLE
+                controller are left initialized rather than deinitialized.
+                BT memory (~20-30 KB) remains reserved for the rest of the
+                boot. If the device ever needs to re-enter BLE provisioning
+                later in the same boot (credentials revoked, a factory
+                reset button, repeated connect failures), it can do so
+                immediately with no restart required, since the controller
+                was never torn down.
+
+                Recommended unless you have measured and confirmed you
+                need the ~20-30 KB back — e.g. on ESP32-S3/PSRAM-equipped
+                variants this RAM is rarely worth the loss of
+                no-reboot re-provisioning. See L8 in 01_overview.md for
+                the original rationale behind freeing this memory, written
+                before this lifecycle choice existed.
+
+        config WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS
+            bool "Free BLE controller memory after success (requires restart to re-provision)"
+            help
+                On successful provisioning, wifi_prov_mgr is deinitialized
+                and the BLE controller / BT memory (~20-30 KB) is released
+                back to the heap for the rest of the boot's normal
+                operation. Choose this only if you have confirmed your
+                application needs that RAM (e.g. heavy TLS/HTTPS buffers,
+                audio processing) on a memory-constrained variant without
+                PSRAM.
+
+                Trade-off: if BLE provisioning is ever needed again later
+                in the same boot (credentials revoked, factory reset
+                button, repeated connect failures with stored credentials),
+                esp_bt_controller_init() will fail every time, since the
+                controller cannot be reinitialized after this release
+                (documented ESP-IDF limitation, not a bug in this
+                component). This component detects that specific failure
+                signature and calls esp_restart() automatically rather
+                than retrying a call that cannot succeed — the device
+                comes back up fresh, with the controller available again,
+                and walks the normal SCANNING -> TW_ACTIVE -> PROVISIONING
+                path. This means re-provisioning after a successful
+                FREE_ON_SUCCESS session costs one automatic restart; this
+                is an intentional, contained "reboot tax" in exchange for
+                the freed memory during normal operation, not a failure
+                state to debug.
+    endchoice
+
+    config WIFI_PROV_BLE_RETRY_BACKOFF_MS
+        int "Backoff before retrying a synchronously-failed BLE restart (ms)"
+        default 2000
+        range 500 30000
+        help
+            Used only by on_prov_failed()'s retry-storm guard: if
+            wifi_prov_mgr_start_provisioning() itself fails synchronously
+            while restarting an existing provisioning session in place
+            (rather than failing via the normal CONFIG_WIFI_PROV_TIMEOUT_MS
+            timeout path), nothing else throttles the next attempt — the
+            prov event handler never fired, so no NOTIFY_PROV_FAILED is
+            coming on its own. This value bounds that wait before retrying
+            once more.
+
+            Deliberately a separate value from CONFIG_WIFI_INTER_SCAN_DELAY_MS,
+            even though both are "pace a retry" delays: WiFi scan pacing and
+            BLE provisioning error recovery are unrelated operational
+            concerns with no reason to share a tuning knob. Raising
+            CONFIG_WIFI_INTER_SCAN_DELAY_MS for a battery-powered deployment's
+            scan cadence should not also slow down recovery from this rare
+            BLE error path, and vice versa.
+
+            This path is rare in practice — it requires the underlying BLE
+            stack to reject a start call outright, not just time out — so
+            the default is intentionally short relative to most other
+            timing values in this component.
 
     config WIFI_TASK_STACK_SIZE
         int "Manager task stack size in bytes"

@@ -9,8 +9,17 @@
  *  - prov event handlers must NOT block
  *  - ap_records_save() is deferred to on_prov_done() in the manager task
  *    (not called from the system event task in the CRED_RECV handler)
- *  - wifi_prov_mgr_deinit() is only ever called from prov_mgr_safe_deinit()
+ *  - wifi_prov_mgr_deinit() is only ever called from prov_mgr_safe_deinit(),
+ *    itself only called from wifi_mgr_prov_stop_succeeded() (conditionally,
+ *    under CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS) and
+ *    wifi_mgr_prov_stop_shutdown() (always) — never from
+ *    wifi_mgr_prov_stop_failed_attempt()
  *  - WIFI_PROV_END handler is a confirmed no-op (see 08_provisioning_flow.md)
+ *  - wifi_mgr_prov_start() retries the existing session in place (no
+ *    init/deinit cycle) whenever CTX->prov_mgr_initialized is already
+ *    true on entry — this is what lets failed/timed-out attempts retry
+ *    indefinitely without hitting the esp_bt_controller_init()-after-deinit
+ *    wall documented by Espressif. See CONFIG_WIFI_PROV_BT_LIFECYCLE.
  *
  * Private — do not include outside wifi_manager.
  */
@@ -24,27 +33,78 @@ extern "C" {
 #endif
 
 /**
- * @brief Initialize and start BLE provisioning.
+ * @brief Initialize (or, if a session already exists, restart in place)
+ *        BLE provisioning.
  *
- * Builds device name from config prefix + MAC suffix.
- * Resolves auth mode from the CONFIG_WIFI_PROV_AUTH_MODE_* choice.
- * On failure, recovers state to SCANNING and posts WIFI_MGR_EVENT_ERROR.
+ * On first call in a boot: builds device name from config prefix + MAC
+ * suffix, resolves auth mode from CONFIG_WIFI_PROV_AUTH_MODE_*, calls
+ * wifi_prov_mgr_init() + wifi_prov_mgr_start_provisioning().
+ *
+ * On subsequent calls where CTX->prov_mgr_initialized is already true
+ * (i.e. the prior session was stopped via
+ * wifi_mgr_prov_stop_failed_attempt(), not deinitialized): skips
+ * wifi_prov_mgr_init() and calls wifi_prov_mgr_start_provisioning()
+ * directly, reusing the device name / PoP / security mode computed on
+ * the first call. This is the retry-in-place path that avoids the BT
+ * controller deinit/reinit cycle.
+ *
+ * On a wifi_prov_mgr_init() failure: if CTX->bt_mem_freed is true (BT
+ * memory was previously released by wifi_mgr_prov_stop_succeeded() under
+ * CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS), this is the documented
+ * unrecoverable-in-this-boot case — posts WIFI_MGR_EVENT_ERROR with
+ * ESP_ERR_WIFI_MGR_BT_PERMANENTLY_RELEASED and calls esp_restart()
+ * (does not return). Otherwise recovers state to SCANNING and posts
+ * WIFI_MGR_EVENT_ERROR as before.
  *
  * Must be called from the manager task only.
  *
- * @return ESP_OK or error.
+ * @return ESP_OK or error. May not return at all (esp_restart() case).
  */
 esp_err_t wifi_mgr_prov_start(void);
 
 /**
- * @brief Stop an active provisioning session.
+ * @brief Stop a provisioning session that failed or timed out.
+ *
+ * Stops the prov_timer and calls wifi_prov_mgr_stop_provisioning(), but
+ * deliberately does NOT deinitialize wifi_prov_mgr or the BLE controller.
+ * This keeps the session alive so wifi_mgr_prov_start()'s retry-in-place
+ * branch can restart it directly on the next attempt, indefinitely,
+ * without ever exercising the BT controller deinit/reinit cycle. Behavior
+ * is identical under both CONFIG_WIFI_PROV_BT_LIFECYCLE policies — they
+ * only differ on the success path (see wifi_mgr_prov_stop_succeeded()).
+ *
+ * Call this from on_prov_failed() only.
+ */
+void wifi_mgr_prov_stop_failed_attempt(void);
+
+/**
+ * @brief Stop a provisioning session that completed successfully.
+ *
+ * Stops the prov_timer and calls wifi_prov_mgr_stop_provisioning().
+ * Whether prov_mgr_safe_deinit() (and BT memory release) follows depends
+ * on CONFIG_WIFI_PROV_BT_LIFECYCLE:
+ *  - FREE_ON_SUCCESS: deinitializes and sets CTX->bt_mem_freed = true.
+ *  - KEEP_ALIVE (default): leaves the session initialized.
+ *
+ * Call this from on_prov_done() only.
+ */
+void wifi_mgr_prov_stop_succeeded(void);
+
+/**
+ * @brief Stop provisioning unconditionally as part of full manager shutdown.
  *
  * Stops the prov_timer, calls wifi_prov_mgr_stop_provisioning(), and
- * calls prov_mgr_safe_deinit() (idempotent). Safe to call even if
+ * always calls prov_mgr_safe_deinit() (idempotent) regardless of
+ * CONFIG_WIFI_PROV_BT_LIFECYCLE policy or whether the most recent attempt
+ * succeeded or failed — there is no "next attempt" to preserve state for,
+ * since the whole manager is being torn down. Safe to call even if
  * provisioning is not active.
+ *
+ * Call this from wifi_mgr_stop() only.
  */
-void wifi_mgr_prov_stop(void);
+void wifi_mgr_prov_stop_shutdown(void);
 
 #ifdef __cplusplus
 }
 #endif
+

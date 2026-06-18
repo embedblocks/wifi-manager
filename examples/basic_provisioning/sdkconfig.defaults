@@ -28,6 +28,25 @@ CONFIG_WIFI_PROV_AUTH_MODE_MAC_POP=y
 #                          than what's actually compiled into the device.
 CONFIG_WIFI_PROV_TIMEOUT_MS=300000
 CONFIG_WIFI_PROV_DEVICE_NAME_PREFIX="PROV_"
+# BT controller lifecycle policy after a *successful* provisioning
+# session. KEEP_ALIVE (default) leaves the BLE controller initialized,
+# so the device can re-enter BLE provisioning later in the same boot
+# (credential revocation, factory reset button) with no restart needed —
+# costs ~20-30KB of heap for the rest of the boot. FREE_ON_SUCCESS
+# recovers that heap but requires an automatic restart if BLE
+# provisioning is ever needed again in the same boot (the component
+# detects this and restarts itself; see WIFI_PROV_BT_LIFECYCLE help text
+# in the component's Kconfig for the full rationale). KEEP_ALIVE is
+# recommended unless you've confirmed you need the RAM back.
+CONFIG_WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE=y
+# CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS=y
+#
+# Backoff before retrying a provisioning restart that fails synchronously
+# (a rare guard path, not the normal timeout-driven retry — see
+# WIFI_PROV_BLE_RETRY_BACKOFF_MS help text in the component's Kconfig).
+# Deliberately separate from WIFI_INTER_SCAN_DELAY_MS above; left at the
+# component default here.
+CONFIG_WIFI_PROV_BLE_RETRY_BACKOFF_MS=2000
 
 # -----------------------------------------------------------------------
 # BLE / Bluetooth

@@ -43,6 +43,24 @@ extern "C" {
  */
 #define ESP_ERR_WIFI_MGR_CANCELED (ESP_ERR_WIFI_MGR_BASE + 1)
 
+/**
+ * @brief BLE controller cannot be re-initialized in this boot session.
+ *
+ * Posted via WIFI_MGR_EVENT_ERROR's wifi_mgr_error_info_t.code, immediately
+ * before this component calls esp_restart() on its own. Occurs only under
+ * CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS, when BLE provisioning is
+ * needed again after a prior successful session already freed the BLE
+ * controller (see WIFI_PROV_BT_LIFECYCLE help text in Kconfig). This is a
+ * documented ESP-IDF limitation — esp_bt_controller_init() is not
+ * supported after a prior esp_bt_controller_deinit() in the same boot —
+ * not a transient fault, so this code signals "restarting now to recover"
+ * rather than "retry this operation." External consumers cannot prevent
+ * the restart; the code exists purely so the event can be logged,
+ * forwarded to telemetry, or used to flush state (e.g. an MQTT last-will)
+ * in the brief window before the restart actually occurs.
+ */
+#define ESP_ERR_WIFI_MGR_BT_PERMANENTLY_RELEASED (ESP_ERR_WIFI_MGR_BASE + 2)
+
 /* ── Event base ──────────────────────────────────────────────────────────── */
 
 ESP_EVENT_DECLARE_BASE(WIFI_MGR_EVENT);
@@ -173,6 +191,16 @@ typedef struct {
     uint32_t inter_scan_delay_ms;     /**< Delay between scans (0 → Kconfig) */
     uint32_t connect_timeout_ms;      /**< Per-AP connect timeout (0 → Kconfig) */
     uint32_t prov_timeout_ms;         /**< Prov session timeout (0 → Kconfig) */
+    uint32_t ble_retry_backoff_ms;    /**< Backoff before retrying a synchronously
+                                         *  failed wifi_prov_mgr_start_provisioning()
+                                         *  call (0 → Kconfig). Deliberately separate
+                                         *  from inter_scan_delay_ms — this paces BLE
+                                         *  provisioning error recovery, not WiFi
+                                         *  scanning, and the two have no reason to
+                                         *  share a tuning knob. Only exercised on the
+                                         *  rare path where the in-place provisioning
+                                         *  restart itself fails synchronously; not
+                                         *  used on the common timeout-driven retry. */
     uint8_t  max_connect_attempts;    /**< Retries per AP (0 → Kconfig) */
     uint8_t  use_count_save_interval; /**< Saves per N connections (0 → Kconfig) */
     char     device_name_prefix[16];  /**< BLE name prefix (empty → Kconfig) */

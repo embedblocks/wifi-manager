@@ -14,6 +14,7 @@
 
 #include "ap_records.h"
 #include "wifi_manager.h"
+#include "wifi_provisioning/manager.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -138,7 +139,21 @@ typedef struct {
     /* Provisioning */
     char  prov_device_name[32];
     char  prov_pop[WIFI_MGR_PROV_POP_BUF_SIZE];
+    wifi_prov_security_t prov_security; /**< Set once on first wifi_mgr_prov_start() call,
+                                           *  reused on retry-in-place restarts so the
+                                           *  security mode doesn't need recomputing from
+                                           *  Kconfig each retry. */
     bool  prov_mgr_initialized;     /**< Guards prov_mgr_safe_deinit idempotency */
+    bool  bt_mem_freed;             /**< Set only under CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS,
+                                       *  after a successful provisioning session frees the BLE
+                                       *  controller. Once true, BLE provisioning cannot be
+                                       *  re-entered in this boot (esp_bt_controller_init() is not
+                                       *  supported after a prior deinit) — wifi_mgr_prov_start()
+                                       *  checks this flag to detect the dead end and restart
+                                       *  instead of retrying a call that cannot succeed. Never set
+                                       *  under CONFIG_WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE. Initialized
+                                       *  false at boot; never cleared (a restart is required to
+                                       *  clear it, by design). */
 
     /* Connect list — populated by wifi_mgr_scan_handle_results() */
     ap_info_t connect_list[CONFIG_MAX_AP_COUNT];

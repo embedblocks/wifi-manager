@@ -927,6 +927,18 @@ esp_err_t wifi_mgr_start(void)
     /* Ensure wait-cancel bit is clear on a fresh start */
     xEventGroupClearBits(CTX->event_group, BIT_CONNECTED | BIT_WAIT_CANCELLED);
 
+    /* Create the default STA network interface. This must happen before
+     * esp_wifi_init() and is the application-visible DHCP client anchor —
+     * without it, IP_EVENT_STA_GOT_IP never fires even after successful
+     * WiFi association, because lwIP has no netif to run DHCP on. The
+     * component owns this netif; callers must NOT create their own STA
+     * netif before calling wifi_mgr_start(). */
+    CTX->sta_netif = esp_netif_create_default_wifi_sta();
+    if (!CTX->sta_netif) {
+        ESP_LOGE(TAG, "esp_netif_create_default_wifi_sta failed");
+        return ESP_FAIL;
+    }
+
     /* Initialize WiFi driver */
     wifi_init_config_t wifi_init_cfg = WIFI_INIT_CONFIG_DEFAULT();
     esp_err_t ret = esp_wifi_init(&wifi_init_cfg);
@@ -934,6 +946,8 @@ esp_err_t wifi_mgr_start(void)
         ESP_LOGE(TAG, "esp_wifi_init failed: %s", esp_err_to_name(ret));
         wifi_mgr_error_info_t err = {.code = ret, .state = WIFI_MGR_STATE_IDLE};
         wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err, sizeof(err));
+        esp_netif_destroy_default_wifi(CTX->sta_netif);
+        CTX->sta_netif = NULL;
         return ret;
     }
 
@@ -941,6 +955,8 @@ esp_err_t wifi_mgr_start(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s", esp_err_to_name(ret));
         esp_wifi_deinit();
+        esp_netif_destroy_default_wifi(CTX->sta_netif);
+        CTX->sta_netif = NULL;
         wifi_mgr_error_info_t err = {.code = ret, .state = WIFI_MGR_STATE_IDLE};
         wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err, sizeof(err));
         return ret;
@@ -950,6 +966,8 @@ esp_err_t wifi_mgr_start(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
         esp_wifi_deinit();
+        esp_netif_destroy_default_wifi(CTX->sta_netif);
+        CTX->sta_netif = NULL;
         wifi_mgr_error_info_t err = {.code = ret, .state = WIFI_MGR_STATE_IDLE};
         wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err, sizeof(err));
         return ret;
@@ -964,6 +982,8 @@ esp_err_t wifi_mgr_start(void)
                  esp_err_to_name(ret));
         esp_wifi_stop();
         esp_wifi_deinit();
+        esp_netif_destroy_default_wifi(CTX->sta_netif);
+        CTX->sta_netif = NULL;
         wifi_mgr_error_info_t err = {.code = ret, .state = WIFI_MGR_STATE_IDLE};
         wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err, sizeof(err));
         return ret;
@@ -992,6 +1012,8 @@ esp_err_t wifi_mgr_start(void)
         ESP_LOGE(TAG, "xTaskCreate failed");
         esp_wifi_stop();
         esp_wifi_deinit();
+        esp_netif_destroy_default_wifi(CTX->sta_netif);
+        CTX->sta_netif = NULL;
         return ESP_ERR_NO_MEM;
     }
 
@@ -1043,6 +1065,10 @@ esp_err_t wifi_mgr_stop(void)
     /* Steps 8-9: tear down WiFi radio */
     esp_wifi_stop();
     esp_wifi_deinit();
+    if (CTX->sta_netif) {
+        esp_netif_destroy_default_wifi(CTX->sta_netif);
+        CTX->sta_netif = NULL;
+    }
 
     /* Steps 10-13: reset state */
     CTX->started       = false;

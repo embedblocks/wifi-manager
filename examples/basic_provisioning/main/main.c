@@ -174,7 +174,11 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    /* 2. Network interface + default event loop */
+    /* 2. Network interface layer + default event loop.
+     * IMPORTANT: do NOT call esp_netif_create_default_wifi_sta() here —
+     * wifi_mgr_start() creates and owns the STA netif. Calling it here
+     * too would create a duplicate netif, which causes DHCP to fail
+     * silently (connected at layer 2 but IP_EVENT_STA_GOT_IP never fires). */
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 

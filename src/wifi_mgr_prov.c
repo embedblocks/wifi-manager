@@ -459,17 +459,19 @@ esp_err_t wifi_mgr_prov_start(void)
 }
 
 
-/* Bound for wifi_mgr_prov_stop_failed_attempt()'s wait for confirmed BLE
- * teardown (CTX->prov_stop_confirm_sem, given from the WIFI_PROV_END
- * handler above — see "Retry Policy" in 08_provisioning_flow.md).
- * Real-hardware logs show this teardown taking roughly 1 second; this
- * bound gives healthy margin over that. Not a Kconfig value: unlike
- * WIFI_PROV_BLE_RETRY_BACKOFF_MS (a guard for a rare failure path an
- * integrator might reasonably want to tune), this bound is sized
- * against ESP-IDF's own internal task teardown time, not a
- * deployment-specific tradeoff — there is no scenario where a different
- * value would be the "right" choice for a given product. */
-#define WIFI_PROV_STOP_CONFIRM_WAIT_MS 1500
+/* Bound for the prov_stop_confirm_sem wait in all three
+ * wifi_mgr_prov_stop_*() functions (see "Retry Policy" in
+ * 08_provisioning_flow.md). Real-hardware logs show two distinct teardown
+ * time profiles: ~430ms when stopping with no active BLE connection (only
+ * advertising was running), and >2000ms when stopping with an active
+ * connection being terminated (the HCI disconnect round-trip to the peer
+ * adds latency that varies with the peer's response time and BLE scheduler
+ * state). 3000ms gives comfortable margin over both. Not a Kconfig value:
+ * unlike WIFI_PROV_BLE_RETRY_BACKOFF_MS (a guard for a rare failure path
+ * an integrator might reasonably want to tune), this bound is sized against
+ * ESP-IDF's internal NimBLE teardown time — not a deployment-specific
+ * tradeoff an integrator can meaningfully choose a different value for. */
+#define WIFI_PROV_STOP_CONFIRM_WAIT_MS 3000
 
 /* Poll granularity for the wait above. The wait is polled in short
  * increments, checking CTX->stop_requested between each one, rather than
@@ -478,7 +480,7 @@ esp_err_t wifi_mgr_prov_start(void)
  * (it only wakes on the semaphore being given, or its own timeout), and
  * wifi_mgr_stop()'s overall shutdown budget (2000ms — see
  * xSemaphoreTake(CTX->stopped_sem, ...) in wifi_mgr_stop()) does not have
- * 1500ms of slack to spare if this wait were allowed to run to its full
+ * 3000ms of slack to spare if this wait were allowed to run to its full
  * bound uninterrupted on every stop. 100ms keeps the worst-case added
  * shutdown latency small relative to that 2000ms budget while still
  * being coarse enough not to busy-poll meaningfully. */

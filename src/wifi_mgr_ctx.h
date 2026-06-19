@@ -21,6 +21,7 @@
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "sdkconfig.h"
+#include "esp_netif.h"
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -124,6 +125,9 @@ typedef struct {
     /* Manager task */
     TaskHandle_t        task_handle;
     SemaphoreHandle_t   stopped_sem;    /**< Given as task's last action before vTaskDelete */
+    esp_netif_t        *sta_netif;      /**< Default STA netif — created in wifi_mgr_start(),
+                                          *  destroyed in wifi_mgr_stop(). The caller must NOT
+                                          *  create their own STA netif; the component owns it. */
 
     /* Timers (all one-shot) */
     TimerHandle_t       tw_timer;       /**< Time-window hard deadline */

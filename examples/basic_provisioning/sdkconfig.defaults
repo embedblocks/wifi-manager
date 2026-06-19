@@ -71,8 +71,28 @@ CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_NVS_ENCRYPTION=n
 
 # -----------------------------------------------------------------------
-# FreeRTOS
+# lwIP / DHCP
 # -----------------------------------------------------------------------
+# Disable the DHCP ARP-check step. When enabled, lwIP sends an ARP probe
+# after receiving a DHCP offer to verify the offered IP is not already in
+# use before accepting it. This is a defensive measure for networks with
+# unreliable DHCP infrastructure — not a concern on any normal home or
+# office network with a real DHCP server.
+#
+# On ESP32 with BLE active concurrently (as during BLE provisioning), the
+# BLE stack competes with WiFi for CPU and radio time. This can delay the
+# ARP probe enough that lwIP's internal ARP-check timer expires and it
+# silently rejects the DHCP offer, then retries the full DISCOVER→OFFER→
+# ARP→fail cycle indefinitely. The WiFi layer reports "connected" (layer 2
+# is up) but DHCP never completes, so IP_EVENT_STA_GOT_IP never fires and
+# WIFI_PROV_CRED_SUCCESS never fires — the provisioning session appears
+# completely stuck until prov_timer expires. Disabling this check resolves
+# the issue entirely. The same ESP32 connects to the same AP immediately
+# outside of provisioning, confirming the ARP-check timing under BLE load
+# is the specific cause.
+CONFIG_LWIP_DHCP_DOES_ARP_CHECK=n
+
+
 CONFIG_FREERTOS_HZ=1000
 
 # -----------------------------------------------------------------------

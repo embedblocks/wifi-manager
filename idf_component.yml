@@ -1,14 +1,46 @@
 version: "0.1.0"
 description: >
-  WiFi lifecycle manager for ESP-IDF: scanning, credential-based reconnection,
-  and BLE provisioning. Other components observe it through an event interface
-  and never touch esp_wifi directly.
+  WiFi lifecycle manager for ESP-IDF. Handles scanning, credential-based
+  reconnection, and BLE provisioning as a single owned component — including
+  disconnect recovery, multi-AP priority, time-window deadlines,
+  retry-in-place provisioning and  NVS-persisted credentials with LRU ranking. 
+  Other components observe state through an event interface and never touch esp_wifi directly.
+
+url: "https://github.com/embedblocks/wifi-manager"
+
 dependencies:
   idf: ">=5.1.0"
+
 targets:
   - esp32
   - esp32s3
   - esp32c3
   - esp32c6
-examples:
-  - path: examples/basic_provisioning
+
+
+tags:
+  - wifi
+  - wifi-manager
+  - wifi-station
+  - ble
+  - ble-provisioning
+  - provisioning
+  - state-machine
+  - auto-reconnect
+  - reconnect
+  - nvs
+  - credentials
+  - event-driven
+  - lru
+
+files:
+   use_gitignore: true
+   exclude:
+      - ".git/**/*"
+      - "docs/**/*"
+      - "dist/**/*"
+      - "*.docx"
+      - "README.txt"
+      - "*.png"
+      - "*.bin"
+      

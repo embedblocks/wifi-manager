@@ -108,25 +108,25 @@ subsequent boots it connects automatically using stored credentials.
 ---
 
 ## State machine
+
+```
 boot
-        │
-        ▼
-    SCANNING ◄────────────────────────────────┐
-        │                                     │
- live AP visible                        disconnect
-        │                                     │
-        ▼                                     │
-    TW_ACTIVE ──── tw expires, no known AP ──►│
-        │                                     │
- known AP visible                             │
-        │                           PROVISIONING
-        ▼                           (retry in place
-   CONNECTING                        on timeout)
-        │                                     ▲
-    connected ──── tw expires ───────────────►│
-        │
-        ▼
-    CONNECTED
+ │
+ ▼
+SCANNING ◄────────────────────────────────────────┐
+ │                                                 │
+ │ live AP visible                      disconnect │
+ ▼                                                 │
+TW_ACTIVE ──── tw expires, no known AP ──► PROVISIONING
+ │                                        (retry in place
+ │ known AP visible                        on timeout)
+ ▼
+CONNECTING
+ │
+ │ connected ──── tw expires ───────────────────────►(PROVISIONING)
+ ▼
+CONNECTED
+```
 
 The time window (`CONFIG_WIFI_KNOWN_AP_WAIT_MS`, default 120 s) is a hard
 deadline. If it expires before a known AP is found and connected,

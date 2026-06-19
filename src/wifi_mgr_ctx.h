@@ -21,8 +21,8 @@
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "sdkconfig.h"
-#include "esp_netif.h"
 #include <stdbool.h>
+#include "esp_netif.h"
 #include <stdint.h>
 
 #ifdef __cplusplus

@@ -1,0 +1,18 @@
+# Custom partition table for basic_provisioning example.
+#
+# The default single-factory partition table gives only 1MB (0x100000) to
+# the app, which is too small for a project linking WiFi + BLE (NimBLE) +
+# wifi_provisioning + mbedTLS simultaneously. This is not unusual — the
+# ESP-IDF wifi_provisioning BLE example itself uses a custom partition
+# table for exactly this reason.
+#
+# This table gives the factory app 1.5MB (0x180000), which comfortably
+# fits the current binary (~1.01MB) and leaves headroom for future growth.
+# NVS is kept at the standard size and offset. No OTA partitions are
+# included since this is a provisioning example, not an OTA-update
+# product; add ota_0/ota_1 partitions here if your real product needs OTA.
+#
+# Name,     Type,  SubType,  Offset,   Size
+nvs,        data,  nvs,      0x9000,   0x6000,
+phy_init,   data,  phy,      0xf000,   0x1000,
+factory,    app,   factory,  0x10000,  0x180000,

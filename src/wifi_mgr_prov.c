@@ -5,8 +5,9 @@
  * See 08_provisioning_flow.md and implementation plan Phase 5 for details.
  *
  * Race condition fix #1 (from 08_provisioning_flow.md):
- * WIFI_PROV_END is a no-op. Deinit happens only via prov_mgr_safe_deinit(),
- * which is now called from exactly two sites: wifi_mgr_prov_stop_succeeded()
+ * WIFI_PROV_END is mostly a no-op (see fix #3 below for the one thing it
+ * now does). Deinit happens only via prov_mgr_safe_deinit(), which is
+ * called from exactly two sites: wifi_mgr_prov_stop_succeeded()
  * (conditionally, under CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS) and
  * wifi_mgr_prov_stop_shutdown() (always, unconditionally). It is
  * deliberately NOT called from wifi_mgr_prov_stop_failed_attempt() — see
@@ -21,11 +22,7 @@
  * the WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM scheme handler used
  * here. Once that has happened, no amount of waiting or retrying makes a
  * later wifi_prov_mgr_init() succeed — it is a hard wall, not a
- * transient race against an async teardown task (an earlier diagnosis
- * assumed wifi_prov_mgr_stop_provisioning() returns before BLE teardown
- * completes; in fact it runs in its default blocking mode in this
- * codebase — wifi_prov_mgr_disable_auto_stop() is never called — so it
- * already waits for the session to fully stop before returning).
+ * transient race against an async teardown task.
  *
  * The fix is to avoid the deinit/reinit cycle entirely on the
  * failure-retry path: wifi_mgr_prov_stop_failed_attempt() never
@@ -35,6 +32,49 @@
  * CTX->bt_mem_freed and CONFIG_WIFI_PROV_BT_LIFECYCLE in Kconfig for how
  * this interacts with the *success* path, where deinit (to free BT
  * memory) is sometimes still desired despite the one-way cost.
+ *
+ * Fix #3 (real-hardware-discovered: wifi_prov_mgr_stop_provisioning()
+ * does NOT wait for BLE teardown before returning, despite running in
+ * its default "blocking" mode — wifi_prov_mgr_disable_auto_stop() is
+ * never called here, which only means stop_provisioning() doesn't merely
+ * schedule a delayed cleanup timer and return immediately; it does NOT
+ * mean the call waits for the internal prov_stop_task() FreeRTOS task to
+ * finish tearing down NimBLE GAP advertising/connections before
+ * returning. This was the original async-teardown diagnosis from this
+ * investigation's first pass — disproven at the time based on a
+ * misreading of "blocking" vs. "non-blocking" mode in the official docs,
+ * then *reconfirmed as correct after all* by a real device log showing
+ * `wifi_prov_mgr: Provisioning service already started` /
+ * `ESP_ERR_INVALID_STATE` on the very first retry-in-place attempt after
+ * every failed/timed-out session, with the actual
+ * `wifi_prov_mgr: Provisioning stopped` confirmation arriving roughly 1
+ * second later. The earlier retry-storm backoff guard in on_prov_failed()
+ * happened to paper over this by coincidence (its backoff duration
+ * exceeded the observed ~1s teardown time), which is why the system
+ * still worked but only by accident, not because the race was actually
+ * closed.):
+ *
+ * wifi_mgr_prov_stop_failed_attempt() now waits — with a bound, not the
+ * unbounded wifi_prov_mgr_wait() — for the WIFI_PROV_END event to
+ * actually fire before returning, using a binary semaphore
+ * (CTX->prov_stop_confirm_sem, see wifi_mgr_ctx.h) given from the
+ * WIFI_PROV_END handler below. A semaphore (rather than a task
+ * notification bit) is used because all three wifi_mgr_prov_stop_*()
+ * functions share this wait, and wifi_mgr_prov_stop_shutdown() is called
+ * from wifi_mgr_stop()'s caller context, not the manager task — a task
+ * notification is only receivable by the specific task it's posted to,
+ * but a semaphore give/take pair works from any task context. Giving
+ * the semaphore from WIFI_PROV_END is safe and does not reopen the race
+ * fix #1 addresses: fix #1 is specifically about not calling
+ * prov_mgr_safe_deinit() (which mutates shared teardown state) from this
+ * handler; giving a semaphore mutates nothing in wifi_prov_mgr's
+ * internal state and has no interaction with CRED_SUCCESS processing.
+ * If the bound expires with no WIFI_PROV_END seen, wifi_mgr_prov_start()'s
+ * retry-in-place branch may still race the teardown and get
+ * ESP_ERR_INVALID_STATE — but this is now a rare residual case the
+ * existing backoff-and-retry-once guard in on_prov_failed() already
+ * handles correctly, rather than the common case it was accidentally
+ * covering for before.
  */
 
 #include "wifi_mgr_prov.h"
@@ -132,12 +172,24 @@ static void wifi_mgr_prov_event_handler(void *arg,
     }
 
     case WIFI_PROV_END:
-        /* Intentional no-op. All deinit is via prov_mgr_safe_deinit(),
-         * called only from wifi_mgr_prov_stop_succeeded() (conditionally)
-         * and wifi_mgr_prov_stop_shutdown() (always) — never from
-         * wifi_mgr_prov_stop_failed_attempt(). Calling deinit here would
-         * race with CRED_SUCCESS processing. */
-        ESP_LOGD(TAG, "WIFI_PROV_END received (no-op)");
+        /* No deinit here — see fix #1 in the file header. Giving this
+         * semaphore is safe and unrelated to that guarantee: it mutates
+         * no wifi_prov_mgr-internal state and has no interaction with
+         * CRED_SUCCESS processing, unlike prov_mgr_safe_deinit() would.
+         * A semaphore (not a task notification) is used because all
+         * three wifi_mgr_prov_stop_*() functions consume it, and one of
+         * them (wifi_mgr_prov_stop_shutdown()) runs in wifi_mgr_stop()'s
+         * caller context, not the manager task — a task notification
+         * only works for the specific task it's posted to, but a
+         * semaphore give/take pair works regardless of which task is on
+         * either end. Binary semaphore: this give is a no-op if it's
+         * already given (e.g. two WIFI_PROV_END events in a row with no
+         * intervening take — cannot happen with the current call
+         * pattern, but xSemaphoreGive() simply returns pdFALSE in that
+         * case rather than corrupting state, since the count is capped
+         * at 1). See CTX->prov_stop_confirm_sem in wifi_mgr_ctx.h. */
+        xSemaphoreGive(CTX->prov_stop_confirm_sem);
+        ESP_LOGD(TAG, "WIFI_PROV_END received");
         break;
 
     default:
@@ -172,6 +224,22 @@ static void prov_mgr_safe_deinit(void)
 
 esp_err_t wifi_mgr_prov_start(void)
 {
+    /* Drain any stale give on CTX->prov_stop_confirm_sem before starting
+     * a new session. This guards against a late WIFI_PROV_END from the
+     * *previous* session's teardown arriving after whichever
+     * wifi_mgr_prov_stop_*() call was waiting on it already gave up
+     * (timed out) — without this drain, that stale give would sit
+     * available and be wrongly consumed by a future, unrelated wait on
+     * this same semaphore for an entirely different teardown. Binary
+     * semaphore, so a zero-timeout take is sufficient regardless of how
+     * many stale gives accumulated (they all collapse to the same single
+     * "available" state — see CTX->prov_stop_confirm_sem in
+     * wifi_mgr_ctx.h). Safe to call unconditionally, including on the
+     * very first call this boot, when the semaphore is already empty by
+     * construction (xSemaphoreCreateBinary() default) and this take
+     * simply returns pdFALSE immediately. */
+    xSemaphoreTake(CTX->prov_stop_confirm_sem, 0);
+
     /* Retry-in-place: if a session already exists (survived a prior
      * failure/timeout without being deinitialized — see
      * prov_mgr_stop_failed_attempt() below), skip straight to
@@ -391,7 +459,32 @@ esp_err_t wifi_mgr_prov_start(void)
 }
 
 
-void wifi_mgr_prov_stop_failed_attempt(void)
+/* Bound for wifi_mgr_prov_stop_failed_attempt()'s wait for confirmed BLE
+ * teardown (CTX->prov_stop_confirm_sem, given from the WIFI_PROV_END
+ * handler above — see "Retry Policy" in 08_provisioning_flow.md).
+ * Real-hardware logs show this teardown taking roughly 1 second; this
+ * bound gives healthy margin over that. Not a Kconfig value: unlike
+ * WIFI_PROV_BLE_RETRY_BACKOFF_MS (a guard for a rare failure path an
+ * integrator might reasonably want to tune), this bound is sized
+ * against ESP-IDF's own internal task teardown time, not a
+ * deployment-specific tradeoff — there is no scenario where a different
+ * value would be the "right" choice for a given product. */
+#define WIFI_PROV_STOP_CONFIRM_WAIT_MS 1500
+
+/* Poll granularity for the wait above. The wait is polled in short
+ * increments, checking CTX->stop_requested between each one, rather than
+ * a single xSemaphoreTake() blocking for the full bound — a plain
+ * xSemaphoreTake() has no way to wake early on stop_requested changing
+ * (it only wakes on the semaphore being given, or its own timeout), and
+ * wifi_mgr_stop()'s overall shutdown budget (2000ms — see
+ * xSemaphoreTake(CTX->stopped_sem, ...) in wifi_mgr_stop()) does not have
+ * 1500ms of slack to spare if this wait were allowed to run to its full
+ * bound uninterrupted on every stop. 100ms keeps the worst-case added
+ * shutdown latency small relative to that 2000ms budget while still
+ * being coarse enough not to busy-poll meaningfully. */
+#define WIFI_PROV_STOP_CONFIRM_POLL_MS 100
+
+bool wifi_mgr_prov_stop_failed_attempt(void)
 {
     xTimerStop(CTX->prov_timer, 0);
     wifi_prov_mgr_stop_provisioning();
@@ -406,7 +499,59 @@ void wifi_mgr_prov_stop_failed_attempt(void)
      * WIFI_PROV_BT_LIFECYCLE policies — the policies differ only in
      * what happens after a *successful* session (see
      * wifi_mgr_prov_stop_succeeded() below), not after a failure. */
+
+    /* Wait for confirmed teardown before returning, so the caller's
+     * subsequent wifi_mgr_prov_start() retry-in-place call doesn't race
+     * prov_stop_task() and get ESP_ERR_INVALID_STATE (fix #3 in the file
+     * header — this is the real-hardware-discovered bug this wait
+     * exists to close). Bounded, not wifi_prov_mgr_wait(): that API has
+     * no timeout parameter at all and would block this task indefinitely
+     * if WIFI_PROV_END somehow never arrives, which is worse than the
+     * rare-residual-race this wait is meant to shrink, not eliminate at
+     * any cost.
+     *
+     * Polled in WIFI_PROV_STOP_CONFIRM_POLL_MS increments rather than one
+     * long xSemaphoreTake() — see that constant's comment above for why.
+     * CTX->stop_requested is checked between polls so a concurrent
+     * wifi_mgr_stop() is noticed within one poll interval, not only
+     * after the full WIFI_PROV_STOP_CONFIRM_WAIT_MS bound elapses.
+     * Returning true here tells the caller (on_prov_failed()) to
+     * propagate a stop upward immediately rather than proceeding to post
+     * PROVISIONING_FAILED and attempt a restart — same convention
+     * on_prov_failed() already uses for its own backoff wait, for the
+     * same reason: the manager is shutting down, not retrying. */
+    TickType_t waited_ticks = 0;
+    const TickType_t poll_ticks = pdMS_TO_TICKS(WIFI_PROV_STOP_CONFIRM_POLL_MS);
+    const TickType_t bound_ticks = pdMS_TO_TICKS(WIFI_PROV_STOP_CONFIRM_WAIT_MS);
+    bool confirmed = false;
+    while (waited_ticks < bound_ticks) {
+        if (CTX->stop_requested) {
+            ESP_LOGD(TAG, "Stop requested while waiting for BLE teardown "
+                          "confirmation — abandoning wait");
+            return true;
+        }
+        TickType_t this_wait = (bound_ticks - waited_ticks < poll_ticks)
+                              ? (bound_ticks - waited_ticks)
+                              : poll_ticks;
+        if (xSemaphoreTake(CTX->prov_stop_confirm_sem, this_wait) == pdTRUE) {
+            confirmed = true;
+            break;
+        }
+        waited_ticks += this_wait;
+    }
+    if (!confirmed) {
+        /* Bound expired without seeing confirmation. Proceed anyway —
+         * wifi_mgr_prov_start()'s existing backoff-and-retry-once guard
+         * in on_prov_failed() remains as the safety net for this rare
+         * residual case, exactly as it already was before this wait
+         * existed (see file header fix #3: that guard is what made the
+         * system self-heal on real hardware even before this fix). */
+        ESP_LOGW(TAG, "Timed out waiting %dms for BLE teardown confirmation "
+                      "— proceeding to retry anyway",
+                 WIFI_PROV_STOP_CONFIRM_WAIT_MS);
+    }
     ESP_LOGD(TAG, "Provisioning attempt stopped (session kept alive for retry)");
+    return false;
 }
 
 void wifi_mgr_prov_stop_succeeded(void)
@@ -415,6 +560,20 @@ void wifi_mgr_prov_stop_succeeded(void)
     wifi_prov_mgr_stop_provisioning();
 
 #if defined(CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS)
+    /* Wait for confirmed BLE teardown before deinitializing — same race
+     * as fix #3 (see file header), but here the consequence of racing is
+     * a potential heap_caps_free assertion crash (see IDF issue #18065),
+     * not just a logged ESP_ERR_INVALID_STATE. A single bounded
+     * xSemaphoreTake() is sufficient here (unlike stop_failed_attempt(),
+     * this function is not inside the manager task's dispatch loop, so
+     * there's no NOTIFY_STOP bit that could be silently consumed by a
+     * competing xTaskNotifyWait() call — and even if stop_requested were
+     * relevant here, this path only runs once per boot on success, not
+     * in a retry loop). If the bound expires, proceed anyway: deinit
+     * *after* a stale partial teardown is still safer than skipping it
+     * and leaking BT memory, since prov_mgr_safe_deinit() is idempotent. */
+    xSemaphoreTake(CTX->prov_stop_confirm_sem,
+                   pdMS_TO_TICKS(WIFI_PROV_STOP_CONFIRM_WAIT_MS));
     prov_mgr_safe_deinit();
     CTX->bt_mem_freed = true;
     ESP_LOGI(TAG, "Provisioning succeeded — BLE controller deinitialized and "
@@ -435,9 +594,22 @@ void wifi_mgr_prov_stop_shutdown(void)
     /* Called only from wifi_mgr_stop() — the manager is being torn down
      * entirely, not retried. Always fully deinitialize regardless of
      * WIFI_PROV_BT_LIFECYCLE policy or CTX->prov_mgr_initialized state;
-     * there is no "next attempt" to keep the controller alive for. */
+     * there is no "next attempt" to keep the controller alive for.
+     *
+     * Wait for confirmed BLE teardown before deinitializing — same race
+     * as fix #3 (see file header). This function is called from
+     * wifi_mgr_stop()'s caller context, not the manager task, which is
+     * why a semaphore (not a task notification) is used: the semaphore
+     * give/take pair works regardless of which task is on either end.
+     * No stop_requested polling here: this function IS the stop path,
+     * and the single bounded xSemaphoreTake() runs in the caller's own
+     * task context rather than the manager task, so there's no dispatch
+     * loop behind us that needs to unblock quickly. If the bound expires,
+     * proceed anyway — deinit is still safer than skipping it. */
     xTimerStop(CTX->prov_timer, 0);
     wifi_prov_mgr_stop_provisioning();
+    xSemaphoreTake(CTX->prov_stop_confirm_sem,
+                   pdMS_TO_TICKS(WIFI_PROV_STOP_CONFIRM_WAIT_MS));
     prov_mgr_safe_deinit();
     ESP_LOGD(TAG, "Provisioning stopped (manager shutdown)");
 }

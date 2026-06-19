@@ -154,6 +154,27 @@ typedef struct {
                                        *  under CONFIG_WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE. Initialized
                                        *  false at boot; never cleared (a restart is required to
                                        *  clear it, by design). */
+    SemaphoreHandle_t prov_stop_confirm_sem; /**< Given from the WIFI_PROV_END handler;
+                                                *  taken (bounded) by all three
+                                                *  wifi_mgr_prov_stop_*() functions to wait
+                                                *  for confirmed BLE teardown before
+                                                *  proceeding — wifi_prov_mgr_stop_provisioning()
+                                                *  does not wait for this itself despite
+                                                *  running in blocking mode (real-hardware-
+                                                *  discovered; see "Retry Policy" in
+                                                *  08_provisioning_flow.md). A semaphore (not
+                                                *  a task notification) is used because
+                                                *  wifi_mgr_prov_stop_shutdown() is called
+                                                *  from wifi_mgr_stop()'s caller context, not
+                                                *  the manager task — a task notification
+                                                *  only works for the specific task it's
+                                                *  posted to. Binary semaphore: starts empty
+                                                *  (xSemaphoreCreateBinary() default); drained
+                                                *  with a zero-timeout take at the start of
+                                                *  wifi_mgr_prov_start() to discard any stale
+                                                *  give left over from a prior session's
+                                                *  WIFI_PROV_END (binary, so multiple stale
+                                                *  gives still collapse to a single drain). */
 
     /* Connect list — populated by wifi_mgr_scan_handle_results() */
     ap_info_t connect_list[CONFIG_MAX_AP_COUNT];

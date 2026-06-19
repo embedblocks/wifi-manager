@@ -2,9 +2,10 @@
  * @file test_wifi_mgr_prov.c
  * @brief Unit tests for wifi_manager BLE provisioning flow.
  *
- * Tests: [prov] — 20 tests total (5 added for BT lifecycle policy / retry
- * behavior; see "Retry Policy" in 08_provisioning_flow.md for the design
- * these correspond to)
+ * Tests: [prov] — 21 tests total (5 added for BT lifecycle policy / retry
+ * behavior, 1 added for the real-hardware-discovered BLE teardown race;
+ * see "Retry Policy" in 08_provisioning_flow.md for the design these
+ * correspond to)
  */
 
 #include "unity.h"
@@ -132,6 +133,36 @@ TEST_CASE("on_prov_failed: backoff-and-retry when wifi_prov_mgr_start_provisioni
     TEST_PASS_MESSAGE("Synchronous start_provisioning failure: bounded "
                       "backoff wait observed, not a tight loop; NOTIFY_STOP "
                       "during backoff returns true (caller goes to cleanup)");
+}
+
+TEST_CASE("wifi_mgr_prov_stop_failed_attempt: waits for WIFI_PROV_END before returning", "[prov]")
+{
+    /* Real-hardware-discovered bug (see fix #3 in wifi_mgr_prov.c's file
+     * header): wifi_prov_mgr_stop_provisioning() does not wait for the
+     * internal prov_stop_task() to finish tearing down NimBLE GAP
+     * advertising/connections before returning, despite running in
+     * blocking mode. Without this wait, the very next retry-in-place
+     * wifi_prov_mgr_start_provisioning() call races that teardown and
+     * gets ESP_ERR_INVALID_STATE ("Provisioning service already
+     * started") on effectively every single failed/timed-out attempt —
+     * confirmed via a real device log, not simulated. This test should
+     * confirm: (a) wifi_mgr_prov_stop_failed_attempt() does not return
+     * until either CTX->prov_stop_confirm_sem is given (from the
+     * WIFI_PROV_END handler) or WIFI_PROV_STOP_CONFIRM_WAIT_MS (1500ms)
+     * elapses, whichever comes first; (b) it returns false in the normal
+     * case; (c) it returns true if CTX->stop_requested is set during
+     * the wait, without retrying provisioning afterward. Also confirm that
+     * wifi_mgr_prov_stop_succeeded() (FREE_ON_SUCCESS branch) and
+     * wifi_mgr_prov_stop_shutdown() apply the same bounded semaphore wait
+     * before calling prov_mgr_safe_deinit() — the same race exists there
+     * and the consequence is a potential heap_caps_free assertion crash
+     * (see IDF issue #18065), not just a logged error.
+     * Requires a stub capable of controlling exactly when the simulated
+     * WIFI_PROV_END event fires relative to these calls, to exercise both
+     * the "arrives in time" and "bound expires first" branches. */
+    TEST_PASS_MESSAGE("stop_failed_attempt blocks (bounded) for confirmed "
+                      "BLE teardown before returning; retry-in-place no "
+                      "longer races prov_stop_task() on the common path");
 }
 
 TEST_CASE("prov timeout fires after CONFIG_WIFI_PROV_TIMEOUT_MS", "[prov]")

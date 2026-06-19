@@ -327,32 +327,41 @@ static void on_prov_done(void)
  *
  * Does NOT revert to SCANNING. The BLE session is stopped (via
  * wifi_mgr_prov_stop_failed_attempt(), which deliberately does not
- * deinitialize wifi_prov_mgr or the BLE controller — see
- * wifi_mgr_prov.h) and immediately restarted via wifi_mgr_prov_start(),
- * which detects the already-initialized session and restarts it in
- * place. This retries indefinitely until credentials are received
- * successfully or the device is power-cycled — there is no bounded
- * retry count and no escalation to SCANNING for this failure mode,
- * by design (see CONFIG_WIFI_PROV_BT_LIFECYCLE in Kconfig for why:
- * reverting to SCANNING would eventually require re-entering
- * PROVISIONING via the tw timer, which would hit the documented
- * esp_bt_controller_init()-after-deinit wall on FREE_ON_SUCCESS, or be
- * pointless churn on KEEP_ALIVE since the session is already alive).
+ * deinitialize wifi_prov_mgr or the BLE controller, and also waits —
+ * bounded — for confirmed BLE teardown before returning; see
+ * wifi_mgr_prov.h and wifi_mgr_prov.c's file header fix #3) and
+ * immediately restarted via wifi_mgr_prov_start(), which detects the
+ * already-initialized session and restarts it in place. This retries
+ * indefinitely until credentials are received successfully or the
+ * device is power-cycled — there is no bounded retry count and no
+ * escalation to SCANNING for this failure mode, by design (see
+ * CONFIG_WIFI_PROV_BT_LIFECYCLE in Kconfig for why: reverting to
+ * SCANNING would eventually require re-entering PROVISIONING via the tw
+ * timer, which would hit the documented esp_bt_controller_init()-after-
+ * deinit wall on FREE_ON_SUCCESS, or be pointless churn on KEEP_ALIVE
+ * since the session is already alive).
  *
  * wifi_mgr_prov_start() can still itself fail or trigger esp_restart()
  * (the CTX->bt_mem_freed dead-end case) — those are handled inside
  * wifi_mgr_prov_start() itself, not here.
  *
- * @return true if a stop was detected during the retry backoff wait and
- *         the caller (the PROVISIONING case in the manager task's
- *         dispatch loop) must `goto cleanup` immediately, exactly as it
- *         already does on its own direct NOTIFY_STOP checks. false in
- *         every other case (including the common path where no backoff
- *         wait was needed at all).
+ * @return true if a stop was detected during either the BLE-teardown
+ *         wait inside wifi_mgr_prov_stop_failed_attempt() or this
+ *         function's own retry backoff wait, and the caller (the
+ *         PROVISIONING case in the manager task's dispatch loop) must
+ *         `goto cleanup` immediately, exactly as it already does on its
+ *         own direct NOTIFY_STOP checks. false in every other case
+ *         (including the common path where no backoff wait was needed
+ *         at all).
  */
 static bool on_prov_failed(void)
 {
-    wifi_mgr_prov_stop_failed_attempt();
+    if (wifi_mgr_prov_stop_failed_attempt()) {
+        /* Stop detected while waiting for BLE teardown confirmation —
+         * propagate immediately. Do NOT post PROVISIONING_FAILED or
+         * attempt a restart below; the manager is shutting down. */
+        return true;
+    }
 
     wifi_mgr_events_post(WIFI_MGR_EVENT_PROVISIONING_FAILED, NULL, 0);
     ESP_LOGW(TAG, "Provisioning attempt failed or timed out — retrying "
@@ -843,6 +852,9 @@ esp_err_t wifi_mgr_init(const wifi_mgr_config_t *config)
     CTX->stopped_sem = xSemaphoreCreateBinary();
     if (!CTX->stopped_sem) goto oom;
 
+    CTX->prov_stop_confirm_sem = xSemaphoreCreateBinary();
+    if (!CTX->prov_stop_confirm_sem) goto oom;
+
     CTX->tw_timer = xTimerCreate("tw_timer",
                                   pdMS_TO_TICKS(CTX->config.known_ap_wait_ms),
                                   pdFALSE, NULL, tw_timer_cb);
@@ -893,6 +905,7 @@ cleanup_timers:
     if (CTX->prov_timer)    { xTimerDelete(CTX->prov_timer, 0);    CTX->prov_timer    = NULL; }
     if (CTX->connect_timer) { xTimerDelete(CTX->connect_timer, 0); CTX->connect_timer = NULL; }
     if (CTX->tw_timer)      { xTimerDelete(CTX->tw_timer, 0);      CTX->tw_timer      = NULL; }
+    if (CTX->prov_stop_confirm_sem) { vSemaphoreDelete(CTX->prov_stop_confirm_sem); CTX->prov_stop_confirm_sem = NULL; }
     if (CTX->stopped_sem)   { vSemaphoreDelete(CTX->stopped_sem);  CTX->stopped_sem   = NULL; }
     if (CTX->event_group)   { vEventGroupDelete(CTX->event_group); CTX->event_group   = NULL; }
     if (CTX->state_mutex)   { vSemaphoreDelete(CTX->state_mutex);  CTX->state_mutex   = NULL; }
@@ -1065,6 +1078,7 @@ esp_err_t wifi_mgr_deinit(void)
     if (CTX->state_mutex)   { vSemaphoreDelete(CTX->state_mutex);  CTX->state_mutex   = NULL; }
     if (CTX->event_group)   { vEventGroupDelete(CTX->event_group); CTX->event_group   = NULL; }
     if (CTX->stopped_sem)   { vSemaphoreDelete(CTX->stopped_sem);  CTX->stopped_sem   = NULL; }
+    if (CTX->prov_stop_confirm_sem) { vSemaphoreDelete(CTX->prov_stop_confirm_sem); CTX->prov_stop_confirm_sem = NULL; }
 
     /* Deinit credential store */
     ap_records_deinit();

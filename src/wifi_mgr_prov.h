@@ -26,6 +26,7 @@
 
 #pragma once
 
+#include <stdbool.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -73,9 +74,26 @@ esp_err_t wifi_mgr_prov_start(void);
  * is identical under both CONFIG_WIFI_PROV_BT_LIFECYCLE policies — they
  * only differ on the success path (see wifi_mgr_prov_stop_succeeded()).
  *
+ * Also waits (bounded — see WIFI_PROV_STOP_CONFIRM_WAIT_MS in
+ * wifi_mgr_prov.c) for confirmation that the underlying NimBLE GAP
+ * teardown has actually finished before returning, since
+ * wifi_prov_mgr_stop_provisioning() does NOT wait for this itself despite
+ * running in blocking mode (real-hardware-discovered — see file header
+ * fix #3 in wifi_mgr_prov.c). This closes the common case of the
+ * caller's subsequent retry-in-place start call racing the teardown and
+ * getting ESP_ERR_INVALID_STATE.
+ *
  * Call this from on_prov_failed() only.
+ *
+ * @return true if a stop was detected (NOTIFY_STOP or CTX->stop_requested)
+ *         while waiting for teardown confirmation — the caller must
+ *         propagate this upward so the manager task's dispatch loop can
+ *         goto cleanup, exactly as on_prov_failed() already does for its
+ *         own backoff wait. false in the normal case, including when the
+ *         bounded wait times out without seeing confirmation (the caller
+ *         proceeds to retry anyway in that case; see fix #3).
  */
-void wifi_mgr_prov_stop_failed_attempt(void);
+bool wifi_mgr_prov_stop_failed_attempt(void);
 
 /**
  * @brief Stop a provisioning session that completed successfully.

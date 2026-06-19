@@ -107,6 +107,33 @@ subsequent boots it connects automatically using stored credentials.
 
 ---
 
+## Example
+
+The `examples/basic_provisioning` directory contains a fully working example
+covering first-boot BLE provisioning and automatic reconnection on subsequent
+boots. It is the reference integration for this component.
+
+```bash
+cd examples/basic_provisioning
+idf.py set-target esp32        # or esp32s3, esp32c3, esp32c6
+idf.py build flash monitor
+```
+
+**First boot** (no stored credentials): the device scans, waits for the
+time-window deadline, then opens a BLE session advertised as
+`PROV_<last3MAC>`. Open the **ESP BLE Prov** app (Android/iOS), select the
+device, enter your WiFi credentials. The device connects, stores the
+credential, and transitions to `CONNECTED`.
+
+**Subsequent boots**: connects automatically to the stored AP, no user
+interaction.
+
+See `examples/basic_provisioning/README.md` for the full guide, including
+auth mode selection (open / static PoP / MAC-derived PoP), headless device
+setup, partition table notes, and credential management at runtime.
+
+---
+
 ## State machine
 
 ```

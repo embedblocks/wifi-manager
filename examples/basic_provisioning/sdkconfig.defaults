@@ -51,19 +51,29 @@ CONFIG_WIFI_PROV_BLE_RETRY_BACKOFF_MS=2000
 # -----------------------------------------------------------------------
 # BLE / Bluetooth
 # -----------------------------------------------------------------------
-# NimBLE is selected explicitly. wifi_provisioning's BLE transport only
+# NimBLE is selected explicitly. network_provisioning's BLE transport only
 # needs BLE (not classic Bluetooth), and NimBLE's flash footprint is
 # roughly half of Bluedroid's for this use case (~300KB vs ~650KB+ in
 # real-world measurements) — the difference between fitting in the
 # default 1MB factory partition and overflowing it.
 #
-# wifi_prov_scheme_ble works against either host; if your application
+# network_prov_scheme_ble works against either host; if your application
 # also needs classic Bluetooth (BT_BLUEDROID + BT_CLASSIC_BT_ENABLED),
 # switch CONFIG_BT_NIMBLE_ENABLED to n and CONFIG_BT_BLUEDROID_ENABLED to
 # y instead, and budget extra partition space accordingly.
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
+
+# -----------------------------------------------------------------------
+# Protocomm security (ESP-IDF v6.0)
+# -----------------------------------------------------------------------
+# ESP-IDF v6.0 turned protocomm security versions 0 and 1 off by default.
+# The wifi_manager Kconfig already selects the right one from
+# CONFIG_WIFI_PROV_AUTH_MODE_* above (MAC_POP / STATIC_POP -> version 1,
+# OPEN -> version 0), so nothing is needed here. Listed only so it's
+# visible when reading this file.
+CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y
 
 # -----------------------------------------------------------------------
 # NVS
@@ -73,7 +83,7 @@ CONFIG_NVS_ENCRYPTION=n
 # -----------------------------------------------------------------------
 # Partition table
 # -----------------------------------------------------------------------
-# WiFi + BLE (NimBLE) + wifi_provisioning + mbedTLS together exceed the
+# WiFi + BLE (NimBLE) + network_provisioning + mbedTLS together exceed the
 # default 1MB single-factory partition. 1.5MB gives comfortable headroom.
 # See partitions.csv in this directory for the full layout and rationale.
 CONFIG_PARTITION_TABLE_CUSTOM=y
@@ -95,7 +105,7 @@ CONFIG_PARTITION_TABLE_OFFSET=0x8000
 # silently rejects the DHCP offer, then retries the full DISCOVER→OFFER→
 # ARP→fail cycle indefinitely. The WiFi layer reports "connected" (layer 2
 # is up) but DHCP never completes, so IP_EVENT_STA_GOT_IP never fires and
-# WIFI_PROV_CRED_SUCCESS never fires — the provisioning session appears
+# NETWORK_PROV_WIFI_CRED_SUCCESS never fires — the provisioning session appears
 # completely stuck until prov_timer expires. Disabling this check resolves
 # the issue entirely. The same ESP32 connects to the same AP immediately
 # outside of provisioning, confirming the ARP-check timing under BLE load

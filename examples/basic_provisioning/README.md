@@ -136,7 +136,7 @@ guide.
 
 `wifi_manager` already releases BT memory automatically once provisioning
 completes — no application code needed. `wifi_mgr_prov.c` configures
-`wifi_prov_mgr_init()` with `WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM`,
+`network_prov_mgr_init()` with `NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM`,
 which frees both classic Bluetooth and BLE memory (recovering roughly
 20–30 KB of heap) as soon as the provisioning manager is torn down.
 
@@ -148,8 +148,8 @@ discussion.
 
 If your product needs classic Bluetooth to keep running after WiFi
 provisioning finishes (uncommon), change the handler constant in
-`wifi_mgr_prov.c` from `WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM` to
-`WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE`, which frees only the BLE
+`wifi_mgr_prov.c` from `NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM` to
+`NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE`, which frees only the BLE
 memory and leaves classic BT intact.
 
 ## Credential management at runtime

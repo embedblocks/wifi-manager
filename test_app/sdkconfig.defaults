@@ -35,7 +35,7 @@ CONFIG_WIFI_PROV_BLE_RETRY_BACKOFF_MS=500
 # -----------------------------------------------------------------------
 # BLE / Bluetooth
 # -----------------------------------------------------------------------
-# wifi_manager unconditionally REQUIRES wifi_provisioning, which links a
+# wifi_manager unconditionally requires network_provisioning, which links a
 # BT host stack regardless of whether tests exercise real BLE provisioning
 # (the stubs in this test_app replace the WiFi driver, not the BT host).
 # NimBLE keeps that footprint small; see examples/basic_provisioning's

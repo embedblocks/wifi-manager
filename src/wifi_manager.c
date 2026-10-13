@@ -51,10 +51,6 @@
 #include "stdio.h"
 #include "inttypes.h"
 
-#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
-#include "esp_wifi.h"  /* for esp_wifi_set_auto_connect */
-#endif
-
 static const char *TAG = "wifi_mgr";
 
 /* ── Global singleton ────────────────────────────────────────────────────── */
@@ -327,7 +323,7 @@ static void on_prov_done(void)
  *
  * Does NOT revert to SCANNING. The BLE session is stopped (via
  * wifi_mgr_prov_stop_failed_attempt(), which deliberately does not
- * deinitialize wifi_prov_mgr or the BLE controller, and also waits —
+ * deinitialize network_prov_mgr or the BLE controller, and also waits —
  * bounded — for confirmed BLE teardown before returning; see
  * wifi_mgr_prov.h and wifi_mgr_prov.c's file header fix #3) and
  * immediately restarted via wifi_mgr_prov_start(), which detects the
@@ -385,7 +381,7 @@ static bool on_prov_failed(void)
          * state is still PROVISIONING here.
          *
          * Guard against a tight retry loop: if
-         * wifi_prov_mgr_start_provisioning() itself fails synchronously
+         * network_prov_mgr_start_provisioning() itself fails synchronously
          * and immediately (rather than via the normal prov_timer
          * timeout), nothing else throttles the next attempt — the prov
          * event handler never fired, so no NOTIFY_PROV_FAILED is coming
@@ -773,7 +769,7 @@ static void manager_task(void *arg)
             if (notif & NOTIFY_PROV_DONE)   { on_prov_done();   continue; }
             if (notif & NOTIFY_PROV_FAILED) { if (on_prov_failed()) goto cleanup; continue; }
             /* NOTIFY_CONNECTED and NOTIFY_DISCONNECTED are silently discarded
-             * in PROVISIONING state. wifi_prov_mgr owns the WiFi stack.
+             * in PROVISIONING state. network_prov_mgr owns the WiFi stack.
              * Acting on CONNECTED would call on_connect_success() with an
              * empty connect_list — undefined behaviour. */
             continue;
@@ -988,10 +984,6 @@ esp_err_t wifi_mgr_start(void)
         wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err, sizeof(err));
         return ret;
     }
-
-#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
-    esp_wifi_set_auto_connect(false);
-#endif
 
     /* Build provisioning device name (stored for later use by prov_start) */
     uint8_t mac[6];

@@ -87,8 +87,18 @@ menu "WiFi Manager"
             BLE Prov app / esp_prov script prompts the operator for before
             it will accept WiFi credentials.
 
+            ESP-IDF v6.0 note: protocomm security versions 0 and 1 are
+            disabled by default in v6.0. Each option below automatically
+            selects the matching CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_x
+            symbol; without it, network_prov_mgr_start_provisioning() fails
+            at runtime with ESP_ERR_NOT_SUPPORTED and no log output.
+
+            SECURITY_1 is Curve25519 key exchange + AES-CTR with the PoP as
+            the shared secret (not SRP6a — that is SECURITY_2).
+
         config WIFI_PROV_AUTH_MODE_OPEN
             bool "Open — no authentication (SECURITY_0)"
+            select ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_0
             help
                 No PoP, no encryption of provisioning traffic. Anyone
                 within BLE range can provision the device. Use only for
@@ -96,6 +106,7 @@ menu "WiFi Manager"
 
         config WIFI_PROV_AUTH_MODE_STATIC_POP
             bool "Static PoP, set via CONFIG_WIFI_PROV_POP (SECURITY_1)"
+            select ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1
             help
                 Use a fixed PoP string compiled into every unit, set below
                 via CONFIG_WIFI_PROV_POP. This is the right choice for
@@ -109,6 +120,7 @@ menu "WiFi Manager"
 
         config WIFI_PROV_AUTH_MODE_MAC_POP
             bool "MAC-derived PoP, logged to console (SECURITY_1, recommended)"
+            select ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1
             help
                 PoP is derived from the device's own MAC address and
                 printed to the serial console at provisioning start (see
@@ -181,14 +193,14 @@ menu "WiFi Manager"
         default WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE
         help
             Controls what happens to the BLE controller and the
-            wifi_prov_mgr instance after provisioning, and governs how
+            network_prov_mgr instance after provisioning, and governs how
             failed/timed-out provisioning attempts are retried.
 
             Background: esp_bt_controller_deinit() is documented by
             Espressif as not fully reversible within a single boot —
             esp_bt_controller_init() is not supported after a prior
-            deinit. Calling wifi_prov_mgr_deinit() with the
-            WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM scheme handler
+            deinit. Calling network_prov_mgr_deinit() with the
+            NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM scheme handler
             (used by this component) triggers exactly that deinit as a
             side effect. So once BT memory has been freed in a given
             boot, a later attempt to re-enter BLE provisioning in the
@@ -196,9 +208,9 @@ menu "WiFi Manager"
             this is a hard wall, not a transient fault.
 
             Provisioning *failures and timeouts* are handled identically
-            under both policies below: the existing wifi_prov_mgr session
+            under both policies below: the existing network_prov_mgr session
             is never torn down on failure, only restarted in place
-            (wifi_prov_mgr_start_provisioning() called again without an
+            (network_prov_mgr_start_provisioning() called again without an
             intervening init/deinit cycle), so failed attempts retry
             indefinitely without ever touching the controller
             teardown/reinit path that triggers the wall above. The two
@@ -208,7 +220,7 @@ menu "WiFi Manager"
         config WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE
             bool "Keep BLE controller initialized after success (recommended default)"
             help
-                On successful provisioning, wifi_prov_mgr and the BLE
+                On successful provisioning, network_prov_mgr and the BLE
                 controller are left initialized rather than deinitialized.
                 BT memory (~20-30 KB) remains reserved for the rest of the
                 boot. If the device ever needs to re-enter BLE provisioning
@@ -227,7 +239,7 @@ menu "WiFi Manager"
         config WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS
             bool "Free BLE controller memory after success (requires restart to re-provision)"
             help
-                On successful provisioning, wifi_prov_mgr is deinitialized
+                On successful provisioning, network_prov_mgr is deinitialized
                 and the BLE controller / BT memory (~20-30 KB) is released
                 back to the heap for the rest of the boot's normal
                 operation. Choose this only if you have confirmed your
@@ -259,7 +271,7 @@ menu "WiFi Manager"
         range 500 30000
         help
             Used only by on_prov_failed()'s retry-storm guard: if
-            wifi_prov_mgr_start_provisioning() itself fails synchronously
+            network_prov_mgr_start_provisioning() itself fails synchronously
             while restarting an existing provisioning session in place
             (rather than failing via the normal CONFIG_WIFI_PROV_TIMEOUT_MS
             timeout path), nothing else throttles the next attempt — the

@@ -1,6 +1,6 @@
 # wifi-manager
 
-![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.x-blue)
+![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v6.0-blue)
 ![Espressif Component Registry](https://img.shields.io/badge/Espressif-Component%20Registry-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -57,16 +57,22 @@ component is designed around those cases.
 
 ## Installation
 
+Requires **ESP-IDF v6.0 or later**. (v0.1.x supports ESP-IDF v5.x.)
+
 ```bash
-idf.py add-dependency "embedblocks/wifi-manager^0.1.0"
+idf.py add-dependency "embedblocks/wifi-manager^0.2.0"
 ```
 
 Or in `idf_component.yml`:
 
 ```yaml
 dependencies:
-  embedblocks/wifi-manager: "^0.1.0"
+  embedblocks/wifi-manager: "^0.2.0"
 ```
+
+`espressif/network_provisioning` (the registry replacement for the
+`wifi_provisioning` component that ESP-IDF v6.0 removed) is pulled in
+automatically as a transitive dependency.
 
 ---
 
@@ -206,7 +212,7 @@ Full event reference in `docs/09_event_system.md`.
 
 ## Partition table
 
-WiFi + BLE (NimBLE) + `wifi_provisioning` + mbedTLS together exceed the
+WiFi + BLE (NimBLE) + `network_provisioning` + mbedTLS together exceed the
 default 1 MB single-factory partition on ESP32. The included example uses
 a custom 1.5 MB partition table (`examples/basic_provisioning/partitions.csv`).
 Use it as a starting point for your own project.

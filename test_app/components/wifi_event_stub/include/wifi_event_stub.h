@@ -81,7 +81,7 @@ void stub_inject_disconnected(uint8_t reason);
 /**
  * @brief Simulate successful provisioning credential receipt + end.
  *
- * Fires WIFI_PROV_CRED_RECV then WIFI_PROV_CRED_SUCCESS then WIFI_PROV_END
+ * Fires NETWORK_PROV_WIFI_CRED_RECV then NETWORK_PROV_WIFI_CRED_SUCCESS then NETWORK_PROV_END
  * in sequence, causing the manager to attempt a connection with the supplied
  * credentials and transition out of PROVISIONING state.
  *
@@ -93,7 +93,7 @@ void stub_inject_prov_success(const char *ssid, const char *password);
 /**
  * @brief Simulate a provisioning failure.
  *
- * Fires WIFI_PROV_CRED_FAIL, causing the manager to post
+ * Fires NETWORK_PROV_WIFI_CRED_FAIL, causing the manager to post
  * WIFI_MGR_EVENT_PROVISIONING_FAILED and transition back to SCANNING.
  */
 void stub_inject_prov_failed(void);

@@ -13,10 +13,14 @@ idf_component_register(
     REQUIRES
         esp_wifi
         esp_event
-        wifi_provisioning
         nvs_flash
         esp_netif
-        bt        
+    PRIV_REQUIRES
+        # ESP-IDF v6.0 removed the built-in wifi_provisioning component.
+        # Its replacement, espressif/network_provisioning, is pulled from
+        # the component registry via idf_component.yml.
+        network_provisioning
+        bt
 )
 
 target_compile_options(${COMPONENT_LIB} PRIVATE -Wextra -Werror)

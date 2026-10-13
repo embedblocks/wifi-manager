@@ -192,7 +192,7 @@ typedef struct {
     uint32_t connect_timeout_ms;      /**< Per-AP connect timeout (0 → Kconfig) */
     uint32_t prov_timeout_ms;         /**< Prov session timeout (0 → Kconfig) */
     uint32_t ble_retry_backoff_ms;    /**< Backoff before retrying a synchronously
-                                         *  failed wifi_prov_mgr_start_provisioning()
+                                         *  failed network_prov_mgr_start_provisioning()
                                          *  call (0 → Kconfig). Deliberately separate
                                          *  from inter_scan_delay_ms — this paces BLE
                                          *  provisioning error recovery, not WiFi

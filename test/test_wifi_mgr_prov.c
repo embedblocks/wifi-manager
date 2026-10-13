@@ -53,7 +53,7 @@ TEST_CASE("on_prov_done: PROVISIONING_DONE posted before CONNECTED", "[prov]")
 
 TEST_CASE("PROV_END handler is a confirmed no-op", "[prov]")
 {
-    TEST_PASS_MESSAGE("WIFI_PROV_END: ESP_LOGD only; no deinit call; race condition prevented");
+    TEST_PASS_MESSAGE("NETWORK_PROV_END: ESP_LOGD only; no deinit call; race condition prevented");
 }
 
 TEST_CASE("prov_mgr_safe_deinit is idempotent: double-call does not crash", "[prov]")
@@ -79,10 +79,10 @@ TEST_CASE("on_prov_failed: retries indefinitely across repeated failures", "[pro
     /* No bounded retry count. Simulate N consecutive NOTIFY_PROV_FAILED
      * (e.g. repeated wrong PoP entries) and confirm the device remains in
      * PROVISIONING and CTX->prov_mgr_initialized stays true throughout —
-     * wifi_prov_mgr_init()/deinit() must not be called again after the
+     * network_prov_mgr_init()/deinit() must not be called again after the
      * first successful init this boot. */
     TEST_PASS_MESSAGE("Repeated on_prov_failed() calls: state stays "
-                      "PROVISIONING; no wifi_prov_mgr_init()/deinit() "
+                      "PROVISIONING; no network_prov_mgr_init()/deinit() "
                       "calls after the first");
 }
 
@@ -110,7 +110,7 @@ TEST_CASE("FREE_ON_SUCCESS policy: BT dead end triggers esp_restart, not SCANNIN
 {
     /* With CTX->bt_mem_freed already true (simulating a prior successful
      * session this boot under FREE_ON_SUCCESS), a subsequent
-     * wifi_mgr_prov_start() call whose wifi_prov_mgr_init() fails must
+     * wifi_mgr_prov_start() call whose network_prov_mgr_init() fails must
      * post WIFI_MGR_EVENT_ERROR with ESP_ERR_WIFI_MGR_BT_PERMANENTLY_RELEASED
      * and call esp_restart() — not recover state to SCANNING. Requires a
      * test harness that can stub esp_bt_controller_init() to fail and
@@ -121,34 +121,34 @@ TEST_CASE("FREE_ON_SUCCESS policy: BT dead end triggers esp_restart, not SCANNIN
                       "called, no SCANNING fallback");
 }
 
-TEST_CASE("on_prov_failed: backoff-and-retry when wifi_prov_mgr_start_provisioning itself fails", "[prov]")
+TEST_CASE("on_prov_failed: backoff-and-retry when network_prov_mgr_start_provisioning itself fails", "[prov]")
 {
     /* If the retry-in-place call inside wifi_mgr_prov_start() fails
      * synchronously (not via prov_timer timeout), on_prov_failed() must
      * not spin tightly: it waits up to CONFIG_WIFI_PROV_BLE_RETRY_BACKOFF_MS
      * (still responsive to NOTIFY_STOP / CTX->stop_requested) before
      * retrying once more. Requires a stub that makes
-     * wifi_prov_mgr_start_provisioning() fail on demand to exercise this
+     * network_prov_mgr_start_provisioning() fail on demand to exercise this
      * path; not covered by the other prov tests above. */
     TEST_PASS_MESSAGE("Synchronous start_provisioning failure: bounded "
                       "backoff wait observed, not a tight loop; NOTIFY_STOP "
                       "during backoff returns true (caller goes to cleanup)");
 }
 
-TEST_CASE("wifi_mgr_prov_stop_failed_attempt: waits for WIFI_PROV_END before returning", "[prov]")
+TEST_CASE("wifi_mgr_prov_stop_failed_attempt: waits for NETWORK_PROV_END before returning", "[prov]")
 {
     /* Real-hardware-discovered bug (see fix #3 in wifi_mgr_prov.c's file
-     * header): wifi_prov_mgr_stop_provisioning() does not wait for the
+     * header): network_prov_mgr_stop_provisioning() does not wait for the
      * internal prov_stop_task() to finish tearing down NimBLE GAP
      * advertising/connections before returning, despite running in
      * blocking mode. Without this wait, the very next retry-in-place
-     * wifi_prov_mgr_start_provisioning() call races that teardown and
+     * network_prov_mgr_start_provisioning() call races that teardown and
      * gets ESP_ERR_INVALID_STATE ("Provisioning service already
      * started") on effectively every single failed/timed-out attempt —
      * confirmed via a real device log, not simulated. This test should
      * confirm: (a) wifi_mgr_prov_stop_failed_attempt() does not return
      * until either CTX->prov_stop_confirm_sem is given (from the
-     * WIFI_PROV_END handler) or WIFI_PROV_STOP_CONFIRM_WAIT_MS (1500ms)
+     * NETWORK_PROV_END handler) or WIFI_PROV_STOP_CONFIRM_WAIT_MS (1500ms)
      * elapses, whichever comes first; (b) it returns false in the normal
      * case; (c) it returns true if CTX->stop_requested is set during
      * the wait, without retrying provisioning afterward. Also confirm that
@@ -158,7 +158,7 @@ TEST_CASE("wifi_mgr_prov_stop_failed_attempt: waits for WIFI_PROV_END before ret
      * and the consequence is a potential heap_caps_free assertion crash
      * (see IDF issue #18065), not just a logged error.
      * Requires a stub capable of controlling exactly when the simulated
-     * WIFI_PROV_END event fires relative to these calls, to exercise both
+     * NETWORK_PROV_END event fires relative to these calls, to exercise both
      * the "arrives in time" and "bound expires first" branches. */
     TEST_PASS_MESSAGE("stop_failed_attempt blocks (bounded) for confirmed "
                       "BLE teardown before returning; retry-in-place no "

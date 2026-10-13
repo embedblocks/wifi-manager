@@ -87,14 +87,14 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ESP_LOGI(TAG, "[wifi] Provisioning complete");
 
         /* NOTE: BT memory is already released automatically at this point.
-         * wifi_mgr_prov.c configures wifi_prov_mgr_init() with
-         * WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM, which frees both
+         * wifi_mgr_prov.c configures network_prov_mgr_init() with
+         * NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM, which frees both
          * classic BT and BLE memory as soon as provisioning completes —
          * no action needed here for the common case.
          *
          * If your application needs to keep classic Bluetooth running
          * after WiFi provisioning (rare), change that handler constant in
-         * wifi_mgr_prov.c to WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE
+         * wifi_mgr_prov.c to NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE
          * instead, which frees only the BLE memory. See L8 in
          * 01_overview.md for the full trade-off discussion. */
         break;

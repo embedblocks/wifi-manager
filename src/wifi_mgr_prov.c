@@ -5,7 +5,7 @@
  * See 08_provisioning_flow.md and implementation plan Phase 5 for details.
  *
  * Race condition fix #1 (from 08_provisioning_flow.md):
- * WIFI_PROV_END is mostly a no-op (see fix #3 below for the one thing it
+ * NETWORK_PROV_END is mostly a no-op (see fix #3 below for the one thing it
  * now does). Deinit happens only via prov_mgr_safe_deinit(), which is
  * called from exactly two sites: wifi_mgr_prov_stop_succeeded()
  * (conditionally, under CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS) and
@@ -18,10 +18,10 @@
  * root cause of the original "BLE_INIT: controller init failed" field
  * bug): esp_bt_controller_init() is documented by Espressif as
  * unsupported after a prior esp_bt_controller_deinit() in the same boot.
- * wifi_prov_mgr_deinit() triggers exactly that deinit as a side effect of
- * the WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM scheme handler used
+ * network_prov_mgr_deinit() triggers exactly that deinit as a side effect of
+ * the NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM scheme handler used
  * here. Once that has happened, no amount of waiting or retrying makes a
- * later wifi_prov_mgr_init() succeed — it is a hard wall, not a
+ * later network_prov_mgr_init() succeed — it is a hard wall, not a
  * transient race against an async teardown task.
  *
  * The fix is to avoid the deinit/reinit cycle entirely on the
@@ -33,9 +33,9 @@
  * this interacts with the *success* path, where deinit (to free BT
  * memory) is sometimes still desired despite the one-way cost.
  *
- * Fix #3 (real-hardware-discovered: wifi_prov_mgr_stop_provisioning()
+ * Fix #3 (real-hardware-discovered: network_prov_mgr_stop_provisioning()
  * does NOT wait for BLE teardown before returning, despite running in
- * its default "blocking" mode — wifi_prov_mgr_disable_auto_stop() is
+ * its default "blocking" mode — network_prov_mgr_disable_auto_stop() is
  * never called here, which only means stop_provisioning() doesn't merely
  * schedule a delayed cleanup timer and return immediately; it does NOT
  * mean the call waits for the internal prov_stop_task() FreeRTOS task to
@@ -44,10 +44,10 @@
  * investigation's first pass — disproven at the time based on a
  * misreading of "blocking" vs. "non-blocking" mode in the official docs,
  * then *reconfirmed as correct after all* by a real device log showing
- * `wifi_prov_mgr: Provisioning service already started` /
+ * `network_prov_mgr: Provisioning service already started` /
  * `ESP_ERR_INVALID_STATE` on the very first retry-in-place attempt after
  * every failed/timed-out session, with the actual
- * `wifi_prov_mgr: Provisioning stopped` confirmation arriving roughly 1
+ * `network_prov_mgr: Provisioning stopped` confirmation arriving roughly 1
  * second later. The earlier retry-storm backoff guard in on_prov_failed()
  * happened to paper over this by coincidence (its backoff duration
  * exceeded the observed ~1s teardown time), which is why the system
@@ -55,26 +55,36 @@
  * closed.):
  *
  * wifi_mgr_prov_stop_failed_attempt() now waits — with a bound, not the
- * unbounded wifi_prov_mgr_wait() — for the WIFI_PROV_END event to
+ * unbounded network_prov_mgr_wait() — for the NETWORK_PROV_END event to
  * actually fire before returning, using a binary semaphore
  * (CTX->prov_stop_confirm_sem, see wifi_mgr_ctx.h) given from the
- * WIFI_PROV_END handler below. A semaphore (rather than a task
+ * NETWORK_PROV_END handler below. A semaphore (rather than a task
  * notification bit) is used because all three wifi_mgr_prov_stop_*()
  * functions share this wait, and wifi_mgr_prov_stop_shutdown() is called
  * from wifi_mgr_stop()'s caller context, not the manager task — a task
  * notification is only receivable by the specific task it's posted to,
  * but a semaphore give/take pair works from any task context. Giving
- * the semaphore from WIFI_PROV_END is safe and does not reopen the race
+ * the semaphore from NETWORK_PROV_END is safe and does not reopen the race
  * fix #1 addresses: fix #1 is specifically about not calling
  * prov_mgr_safe_deinit() (which mutates shared teardown state) from this
- * handler; giving a semaphore mutates nothing in wifi_prov_mgr's
+ * handler; giving a semaphore mutates nothing in network_prov_mgr's
  * internal state and has no interaction with CRED_SUCCESS processing.
- * If the bound expires with no WIFI_PROV_END seen, wifi_mgr_prov_start()'s
+ * If the bound expires with no NETWORK_PROV_END seen, wifi_mgr_prov_start()'s
  * retry-in-place branch may still race the teardown and get
  * ESP_ERR_INVALID_STATE — but this is now a rare residual case the
  * existing backoff-and-retry-once guard in on_prov_failed() already
  * handles correctly, rather than the common case it was accidentally
  * covering for before.
+ *
+ * ESP-IDF v6.0 port: wifi_provisioning was removed from ESP-IDF v6.0 and
+ * replaced by the espressif/network_provisioning registry component. The
+ * API is a 1:1 rename (wifi_prov_* -> network_prov_*, WIFI_PROV_CRED_* ->
+ * NETWORK_PROV_WIFI_CRED_*, WIFI_PROV_END -> NETWORK_PROV_END) and the
+ * lifecycle semantics the fixes above depend on are unchanged. Its
+ * header now states outright that network_prov_mgr_stop_provisioning()
+ * "will initiate a process to stop the service and return", with
+ * NETWORK_PROV_END emitted once the service actually stops — which is
+ * exactly the async behaviour fix #3 was written to handle.
  */
 
 #include "wifi_mgr_prov.h"
@@ -85,12 +95,26 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
-#include "wifi_provisioning/manager.h"
-#include "wifi_provisioning/scheme_ble.h"
+#include "network_provisioning/manager.h"
+#include "network_provisioning/scheme_ble.h"
 #include "string.h"
 #include "stdio.h"
 
 static const char *TAG = "wifi_mgr";
+
+/* ESP-IDF v6.0: protocomm security versions 0 and 1 default to disabled.
+ * Kconfig selects the right one from CONFIG_WIFI_PROV_AUTH_MODE_*, but if
+ * that select is ever bypassed (e.g. a hand-edited sdkconfig), fail the
+ * build here instead of letting network_prov_mgr_start_provisioning()
+ * return ESP_ERR_NOT_SUPPORTED at runtime with no log output. */
+#if defined(CONFIG_WIFI_PROV_AUTH_MODE_OPEN) && \
+    !defined(CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_0)
+#error "WIFI_PROV_AUTH_MODE_OPEN requires CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_0=y (off by default in ESP-IDF v6.0)"
+#endif
+#if (defined(CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP) || defined(CONFIG_WIFI_PROV_AUTH_MODE_MAC_POP)) && \
+    !defined(CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1)
+#error "PoP-based provisioning requires CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_1=y (off by default in ESP-IDF v6.0)"
+#endif
 
 /* Catch an oversized static PoP at compile time rather than silently
  * truncating it at runtime (strncpy would otherwise cut it to fit, and
@@ -119,9 +143,9 @@ static void wifi_mgr_prov_event_handler(void *arg,
                                          int32_t event_id,
                                          void *event_data)
 {
-    switch ((wifi_prov_cb_event_t)event_id) {
+    switch ((network_prov_cb_event_t)event_id) {
 
-    case WIFI_PROV_CRED_RECV: {
+    case NETWORK_PROV_WIFI_CRED_RECV: {
         /* Credentials received from the provisioning app.
          * Add to ap_records in RAM; defer NVS save to on_prov_done()
          * which runs in the manager task context (not the system event task).
@@ -140,8 +164,8 @@ static void wifi_mgr_prov_event_handler(void *arg,
         break;
     }
 
-    case WIFI_PROV_CRED_SUCCESS: {
-        /* wifi_prov_mgr has connected to the AP and obtained an IP.
+    case NETWORK_PROV_WIFI_CRED_SUCCESS: {
+        /* network_prov_mgr has connected to the AP and obtained an IP.
          * Pre-fill conn_info before xTaskNotify to satisfy the
          * happens-before contract on dual-core (05_internal_architecture.md). */
         wifi_ap_record_t ap_info;
@@ -161,20 +185,20 @@ static void wifi_mgr_prov_event_handler(void *arg,
         break;
     }
 
-    case WIFI_PROV_CRED_FAIL: {
-        wifi_prov_sta_fail_reason_t *reason = (wifi_prov_sta_fail_reason_t *)event_data;
+    case NETWORK_PROV_WIFI_CRED_FAIL: {
+        network_prov_wifi_sta_fail_reason_t *reason = (network_prov_wifi_sta_fail_reason_t *)event_data;
         ESP_LOGE(TAG, "Provisioning credential failure, reason: %s",
-                 (*reason == WIFI_PROV_STA_AUTH_ERROR)
+                 (*reason == NETWORK_PROV_WIFI_STA_AUTH_ERROR)
                      ? "Auth error (wrong password?)"
                      : "AP not found");
         xTaskNotify(CTX->task_handle, NOTIFY_PROV_FAILED, eSetBits);
         break;
     }
 
-    case WIFI_PROV_END:
+    case NETWORK_PROV_END:
         /* No deinit here — see fix #1 in the file header. Giving this
          * semaphore is safe and unrelated to that guarantee: it mutates
-         * no wifi_prov_mgr-internal state and has no interaction with
+         * no network_prov_mgr-internal state and has no interaction with
          * CRED_SUCCESS processing, unlike prov_mgr_safe_deinit() would.
          * A semaphore (not a task notification) is used because all
          * three wifi_mgr_prov_stop_*() functions consume it, and one of
@@ -183,13 +207,13 @@ static void wifi_mgr_prov_event_handler(void *arg,
          * only works for the specific task it's posted to, but a
          * semaphore give/take pair works regardless of which task is on
          * either end. Binary semaphore: this give is a no-op if it's
-         * already given (e.g. two WIFI_PROV_END events in a row with no
+         * already given (e.g. two NETWORK_PROV_END events in a row with no
          * intervening take — cannot happen with the current call
          * pattern, but xSemaphoreGive() simply returns pdFALSE in that
          * case rather than corrupting state, since the count is capped
          * at 1). See CTX->prov_stop_confirm_sem in wifi_mgr_ctx.h. */
         xSemaphoreGive(CTX->prov_stop_confirm_sem);
-        ESP_LOGD(TAG, "WIFI_PROV_END received");
+        ESP_LOGD(TAG, "NETWORK_PROV_END received");
         break;
 
     default:
@@ -214,9 +238,9 @@ static void prov_mgr_safe_deinit(void)
         return;
     }
     CTX->prov_mgr_initialized = false;
-    esp_event_handler_unregister(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
+    esp_event_handler_unregister(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID,
                                  wifi_mgr_prov_event_handler);
-    wifi_prov_mgr_deinit();
+    network_prov_mgr_deinit();
     ESP_LOGD(TAG, "prov_mgr deinitialized");
 }
 
@@ -225,7 +249,7 @@ static void prov_mgr_safe_deinit(void)
 esp_err_t wifi_mgr_prov_start(void)
 {
     /* Drain any stale give on CTX->prov_stop_confirm_sem before starting
-     * a new session. This guards against a late WIFI_PROV_END from the
+     * a new session. This guards against a late NETWORK_PROV_END from the
      * *previous* session's teardown arriving after whichever
      * wifi_mgr_prov_stop_*() call was waiting on it already gave up
      * (timed out) — without this drain, that stale give would sit
@@ -243,7 +267,7 @@ esp_err_t wifi_mgr_prov_start(void)
     /* Retry-in-place: if a session already exists (survived a prior
      * failure/timeout without being deinitialized — see
      * prov_mgr_stop_failed_attempt() below), skip straight to
-     * (re)starting the session rather than re-running wifi_prov_mgr_init().
+     * (re)starting the session rather than re-running network_prov_mgr_init().
      * This is what makes failed/timed-out attempts retry indefinitely
      * without ever touching the controller deinit/reinit cycle that
      * triggers the documented ESP-IDF wall (esp_bt_controller_init() is
@@ -251,11 +275,11 @@ esp_err_t wifi_mgr_prov_start(void)
      * boot). Device name / PoP were already set on the first call and do
      * not change between retries, so they are not recomputed here. */
     if (CTX->prov_mgr_initialized) {
-        esp_err_t ret = wifi_prov_mgr_start_provisioning(
+        esp_err_t ret = network_prov_mgr_start_provisioning(
             CTX->prov_security, CTX->prov_pop[0] != '\0' ? CTX->prov_pop : NULL,
             CTX->prov_device_name, NULL);
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "wifi_prov_mgr_start_provisioning (retry) failed: %s",
+            ESP_LOGE(TAG, "network_prov_mgr_start_provisioning (retry) failed: %s",
                      esp_err_to_name(ret));
             wifi_mgr_error_info_t err_info = {
                 .code               = ret,
@@ -267,7 +291,7 @@ esp_err_t wifi_mgr_prov_start(void)
              * the caller (on_prov_failed(), via the prov_timer or another
              * NOTIFY_PROV_FAILED) try again. The session is still alive;
              * a transient start failure here is not the BT dead end
-             * (that can only be hit via wifi_prov_mgr_init(), below). */
+             * (that can only be hit via network_prov_mgr_init(), below). */
             return ret;
         }
         if (CTX->config.prov_timeout_ms > 0) {
@@ -294,18 +318,18 @@ esp_err_t wifi_mgr_prov_start(void)
     /* Resolve auth mode and PoP. Branches are compile-time (#if, not
      * switch) since CONFIG_WIFI_PROV_AUTH_MODE is now a Kconfig choice —
      * each option is its own bool symbol rather than one int value. */
-    wifi_prov_security_t security;
+    network_prov_security_t security;
     const char *pop = NULL;
     const char *auth_str;
     bool log_pop = false;
 
 #if defined(CONFIG_WIFI_PROV_AUTH_MODE_OPEN)
-    security = WIFI_PROV_SECURITY_0;
+    security = NETWORK_PROV_SECURITY_0;
     CTX->prov_pop[0] = '\0';
     auth_str = "Open (no security)";
 
 #elif defined(CONFIG_WIFI_PROV_AUTH_MODE_STATIC_POP)
-    security = WIFI_PROV_SECURITY_1;
+    security = NETWORK_PROV_SECURITY_1;
     if (strlen(CONFIG_WIFI_PROV_POP) >= sizeof(CTX->prov_pop)) {
         /* Should be unreachable — the _Static_assert above this function
          * already catches this at compile time. Kept as defense in depth
@@ -327,7 +351,7 @@ esp_err_t wifi_mgr_prov_start(void)
     strncpy(CTX->prov_pop, CONFIG_WIFI_PROV_POP, sizeof(CTX->prov_pop) - 1);
     CTX->prov_pop[sizeof(CTX->prov_pop) - 1] = '\0';
     pop = CTX->prov_pop;
-    auth_str = "SRP6a / static";
+    auth_str = "Security 1 (X25519 + AES-CTR) / static PoP";
     /* Not logged by default: the integrator already set this value in
      * their own sdkconfig.defaults (that's the point of static mode for
      * headless devices), so printing it to the console adds nothing and
@@ -336,11 +360,11 @@ esp_err_t wifi_mgr_prov_start(void)
     log_pop = false;
 
 #else /* CONFIG_WIFI_PROV_AUTH_MODE_MAC_POP (default) */
-    security = WIFI_PROV_SECURITY_1;
+    security = NETWORK_PROV_SECURITY_1;
     snprintf(CTX->prov_pop, sizeof(CTX->prov_pop),
              "%02x%02x%02x%02x", mac[2], mac[3], mac[4], mac[5]);
     pop = CTX->prov_pop;
-    auth_str = "SRP6a / MAC-derived";
+    auth_str = "Security 1 (X25519 + AES-CTR) / MAC-derived PoP";
     /* Must be logged: this is the only way the operator can learn a
      * value that's unique per device and not known ahead of time. */
     log_pop = true;
@@ -357,7 +381,11 @@ esp_err_t wifi_mgr_prov_start(void)
     ESP_LOGI(TAG, "BLE Provisioning started");
     ESP_LOGI(TAG, "  Device Name : %s", CTX->prov_device_name);
     ESP_LOGI(TAG, "  Auth Mode   : %s", auth_str);
-    if (security == WIFI_PROV_SECURITY_1) {
+    /* pop is non-NULL exactly when a Security 1 mode is selected. Not
+     * written as `security == NETWORK_PROV_SECURITY_1`: network_provisioning
+     * only declares that enum member when protocomm security v1 is enabled,
+     * so the comparison would not compile under AUTH_MODE_OPEN. */
+    if (pop != NULL) {
         if (log_pop) {
             ESP_LOGI(TAG, "  PoP         : %s", pop);
         } else {
@@ -368,14 +396,14 @@ esp_err_t wifi_mgr_prov_start(void)
     ESP_LOGI(TAG, "-----------------------------------------");
 
     /* Initialize provisioning manager */
-    wifi_prov_mgr_config_t prov_cfg = {
-        .scheme               = wifi_prov_scheme_ble,
-        .scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
+    network_prov_mgr_config_t prov_cfg = {
+        .scheme               = network_prov_scheme_ble,
+        .scheme_event_handler = NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM,
     };
 
-    esp_err_t ret = wifi_prov_mgr_init(prov_cfg);
+    esp_err_t ret = network_prov_mgr_init(prov_cfg);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "wifi_prov_mgr_init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "network_prov_mgr_init failed: %s", esp_err_to_name(ret));
 
         if (CTX->bt_mem_freed) {
             /* The dead end: BT memory was released after a prior
@@ -416,25 +444,25 @@ esp_err_t wifi_mgr_prov_start(void)
     }
 
     /* Register prov event handler */
-    ret = esp_event_handler_register(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
+    ret = esp_event_handler_register(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID,
                                      wifi_mgr_prov_event_handler, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to register prov event handler: %s",
                  esp_err_to_name(ret));
-        wifi_prov_mgr_deinit();
+        network_prov_mgr_deinit();
         wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
         return ret;
     }
 
     /* Start provisioning */
-    ret = wifi_prov_mgr_start_provisioning(security, pop,
+    ret = network_prov_mgr_start_provisioning(security, pop,
                                            CTX->prov_device_name, NULL);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "wifi_prov_mgr_start_provisioning failed: %s",
+        ESP_LOGE(TAG, "network_prov_mgr_start_provisioning failed: %s",
                  esp_err_to_name(ret));
-        esp_event_handler_unregister(WIFI_PROV_EVENT, ESP_EVENT_ANY_ID,
+        esp_event_handler_unregister(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID,
                                      wifi_mgr_prov_event_handler);
-        wifi_prov_mgr_deinit();
+        network_prov_mgr_deinit();
         wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
         wifi_mgr_error_info_t err_info = {
             .code               = ret,
@@ -489,7 +517,7 @@ esp_err_t wifi_mgr_prov_start(void)
 bool wifi_mgr_prov_stop_failed_attempt(void)
 {
     xTimerStop(CTX->prov_timer, 0);
-    wifi_prov_mgr_stop_provisioning();
+    network_prov_mgr_stop_provisioning();
 
     /* Deliberately do NOT call prov_mgr_safe_deinit() here. Leaving the
      * session (and the BLE controller) initialized is what allows
@@ -506,9 +534,9 @@ bool wifi_mgr_prov_stop_failed_attempt(void)
      * subsequent wifi_mgr_prov_start() retry-in-place call doesn't race
      * prov_stop_task() and get ESP_ERR_INVALID_STATE (fix #3 in the file
      * header — this is the real-hardware-discovered bug this wait
-     * exists to close). Bounded, not wifi_prov_mgr_wait(): that API has
+     * exists to close). Bounded, not network_prov_mgr_wait(): that API has
      * no timeout parameter at all and would block this task indefinitely
-     * if WIFI_PROV_END somehow never arrives, which is worse than the
+     * if NETWORK_PROV_END somehow never arrives, which is worse than the
      * rare-residual-race this wait is meant to shrink, not eliminate at
      * any cost.
      *
@@ -559,7 +587,7 @@ bool wifi_mgr_prov_stop_failed_attempt(void)
 void wifi_mgr_prov_stop_succeeded(void)
 {
     xTimerStop(CTX->prov_timer, 0);
-    wifi_prov_mgr_stop_provisioning();
+    network_prov_mgr_stop_provisioning();
 
 #if defined(CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS)
     /* Wait for confirmed BLE teardown before deinitializing — same race
@@ -609,7 +637,7 @@ void wifi_mgr_prov_stop_shutdown(void)
      * loop behind us that needs to unblock quickly. If the bound expires,
      * proceed anyway — deinit is still safer than skipping it. */
     xTimerStop(CTX->prov_timer, 0);
-    wifi_prov_mgr_stop_provisioning();
+    network_prov_mgr_stop_provisioning();
     xSemaphoreTake(CTX->prov_stop_confirm_sem,
                    pdMS_TO_TICKS(WIFI_PROV_STOP_CONFIRM_WAIT_MS));
     prov_mgr_safe_deinit();

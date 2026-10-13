@@ -14,7 +14,7 @@
 
 #include "ap_records.h"
 #include "wifi_manager.h"
-#include "wifi_provisioning/manager.h"
+#include "network_provisioning/manager.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -143,7 +143,7 @@ typedef struct {
     /* Provisioning */
     char  prov_device_name[32];
     char  prov_pop[WIFI_MGR_PROV_POP_BUF_SIZE];
-    wifi_prov_security_t prov_security; /**< Set once on first wifi_mgr_prov_start() call,
+    network_prov_security_t prov_security; /**< Set once on first wifi_mgr_prov_start() call,
                                            *  reused on retry-in-place restarts so the
                                            *  security mode doesn't need recomputing from
                                            *  Kconfig each retry. */
@@ -158,11 +158,11 @@ typedef struct {
                                        *  under CONFIG_WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE. Initialized
                                        *  false at boot; never cleared (a restart is required to
                                        *  clear it, by design). */
-    SemaphoreHandle_t prov_stop_confirm_sem; /**< Given from the WIFI_PROV_END handler;
+    SemaphoreHandle_t prov_stop_confirm_sem; /**< Given from the NETWORK_PROV_END handler;
                                                 *  taken (bounded) by all three
                                                 *  wifi_mgr_prov_stop_*() functions to wait
                                                 *  for confirmed BLE teardown before
-                                                *  proceeding — wifi_prov_mgr_stop_provisioning()
+                                                *  proceeding — network_prov_mgr_stop_provisioning()
                                                 *  does not wait for this itself despite
                                                 *  running in blocking mode (real-hardware-
                                                 *  discovered; see "Retry Policy" in
@@ -177,7 +177,7 @@ typedef struct {
                                                 *  with a zero-timeout take at the start of
                                                 *  wifi_mgr_prov_start() to discard any stale
                                                 *  give left over from a prior session's
-                                                *  WIFI_PROV_END (binary, so multiple stale
+                                                *  NETWORK_PROV_END (binary, so multiple stale
                                                 *  gives still collapse to a single drain). */
 
     /* Connect list — populated by wifi_mgr_scan_handle_results() */

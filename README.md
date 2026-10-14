@@ -60,19 +60,58 @@ component is designed around those cases.
 Requires **ESP-IDF v6.0 or later**. (v0.1.x supports ESP-IDF v5.x.)
 
 ```bash
-idf.py add-dependency "embedblocks/wifi-manager^0.3.1"
+idf.py add-dependency "embedblocks/wifi-manager^0.4.0"
 ```
 
 Or in `idf_component.yml`:
 
 ```yaml
 dependencies:
-  embedblocks/wifi-manager: "^0.3.1"
+  embedblocks/wifi-manager: "^0.4.0"
 ```
 
 `espressif/network_provisioning` (the registry replacement for the
 `wifi_provisioning` component that ESP-IDF v6.0 removed) is pulled in
 automatically as a transitive dependency.
+
+---
+
+## Integration checklist
+
+1. Call `nvs_flash_init()`, `esp_netif_init()` and
+   `esp_event_loop_create_default()` before `wifi_mgr_init()`. Do **not**
+   create the STA netif yourself.
+2. **Provide a Wi-Fi setup trigger.** A device provisions on its own only
+   while it holds no credentials. To add a network later (device moved,
+   router replaced, password changed), your application must call
+   `wifi_mgr_reboot_into_setup()` — from a button, an app command, a
+   power-cycle gesture, whatever your product has. The component contains
+   no GPIO code. `examples/basic_provisioning` shows a setup button built
+   on `espressif/button` (hold 3 s = setup, hold 10 s = forget all
+   networks, decided on release).
+   Without a trigger, a provisioned device can never get a new network
+   without reflashing; the component logs a hint once per boot when it
+   notices.
+3. Choose `CONFIG_WIFI_PS_MODE` (or `wifi_mgr_config_t.ps_mode`). Use
+   `NONE` for audio or other latency-sensitive traffic. Don't call
+   `esp_wifi_set_ps()` yourself.
+4. Choose a PoP mode (`CONFIG_WIFI_PROV_AUTH_MODE_*`).
+
+### Setup mode in short
+
+- `wifi_mgr_reboot_into_setup()` reboots (it does not return) and the
+  device comes up in BLE provisioning. Stored networks are kept. Save
+  application state first with `esp_register_shutdown_handler()` if needed.
+- `wifi_mgr_forget_all_and_reboot_into_setup()` forgets every network
+  first; if that can't be committed to NVS it returns the error and does
+  not reboot.
+- With credentials stored, setup mode ends after
+  `CONFIG_WIFI_SETUP_DEADLINE_MS` (5 min), extended while a phone is
+  connected or credentials are being tried, capped at
+  `CONFIG_WIFI_SETUP_MAX_MS` (15 min). The device then returns to its
+  stored networks. A wrong password just restarts the attempt.
+- `wifi_mgr_start_ble_provisioning()` enters setup mode without a reboot,
+  for applications that must keep running.
 
 ---
 
@@ -178,6 +217,10 @@ All timing and behaviour is controlled via Kconfig
 |---|---|---|
 | `CONFIG_MAX_AP_COUNT` | 5 | Max stored credentials |
 | `CONFIG_WIFI_KNOWN_AP_WAIT_MS` | 120 000 | Time-window deadline (ms) |
+| `CONFIG_WIFI_SETUP_DEADLINE_MS` | 300 000 | Setup mode length when credentials are stored |
+| `CONFIG_WIFI_SETUP_GRACE_MS` | 60 000 | Extension while a phone is connected / credentials are tried |
+| `CONFIG_WIFI_SETUP_MAX_MS` | 900 000 | Hard cap on setup mode when credentials are stored |
+| `CONFIG_WIFI_PS_MODE` | `MIN_MODEM` | Wi-Fi power save (also `wifi_mgr_config_t.ps_mode`) |
 | `CONFIG_WIFI_AUTO_PROVISION` | `WHEN_UNPROVISIONED` | When tw expiry may start BLE provisioning on its own (also `wifi_mgr_config_t.auto_provision`) |
 | `CONFIG_WIFI_INTER_SCAN_DELAY_MS` | 3 000 | Delay between scan cycles |
 | `CONFIG_WIFI_CONNECT_TIMEOUT_MS` | 8 000 | Per-AP connection timeout |
@@ -247,20 +290,21 @@ No direct `esp_wifi_*` calls are needed or expected from application code.
 A full list with mitigations is in `docs/01_overview.md`. The most
 operationally relevant:
 
-- **Recovering from a changed router password needs a manual trigger.**
-  Under the default `auto_provision` policy a provisioned device never
-  re-enters BLE provisioning by itself; it posts
-  `WIFI_MGR_EVENT_KNOWN_AP_UNREACHABLE` and keeps trying. Give the product
-  a way to call `wifi_mgr_start_ble_provisioning()` (button, gesture, app).
+- **Adding a network to a provisioned device needs a setup trigger** (see
+  the Integration checklist). Under the default `auto_provision` policy it
+  never re-enters setup mode by itself — not after a move, a router
+  replacement or a password change; it posts `NO_KNOWN_AP_IN_TW` /
+  `KNOWN_AP_UNREACHABLE` and keeps trying.
 - **Hidden SSIDs** require `CONFIG_WIFI_SCAN_HIDDEN=y`
 - **Duplicate SSIDs** (two networks, same name, different passwords) —
   only one credential can be stored; SSID is the primary key
 - **OTA struct changes** to `ap_record_t` wipe stored credentials on
   first boot after update — plan a migration strategy before shipping
-- **BT memory release** after provisioning
-  (`CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS`) is a one-way
-  operation per boot — BLE re-provisioning without reboot requires
-  `KEEP_ALIVE` (the default)
+- **Bluetooth memory release** after provisioning
+  (`CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS`) is one-way per boot:
+  entering setup mode again reboots the device into setup mode first.
+  `KEEP_ALIVE` (the default) avoids the reboot at the cost of the reserved
+  memory. Don't combine `FREE_ON_SUCCESS` with `auto_provision = ALWAYS`.
 
 ---
 
@@ -277,6 +321,9 @@ operationally relevant:
 | `docs/07_connect_flow.md` | Connection and retry logic |
 | `docs/08_provisioning_flow.md` | BLE provisioning, retry policy, race condition fixes |
 | `docs/09_event_system.md` | Event reference and usage patterns |
+| `docs/10_integration.md` | Boot sequences and integration patterns |
+| `docs/11_test_plan_0.3.0.md` | Hardware test plan (0.3.x – 0.4.0) |
+| `docs/12_setup_mode.md` | **Current reference:** setup mode, provisioning policy, driver NVS handling, Bluetooth lifecycle |
 
 ---
 

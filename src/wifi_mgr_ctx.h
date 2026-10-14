@@ -42,6 +42,15 @@ extern "C" {
 #define NOTIFY_PROV_DONE        (1u << 5)   /* priority 7 */
 #define NOTIFY_PROV_FAILED      (1u << 6)   /* priority 8 (lowest among prov) */
 #define NOTIFY_STOP             (1u << 7)   /* priority 1 (highest) */
+#define NOTIFY_WAKE             (1u << 9)   /* "re-read state": sent when another
+                                             * task changed state while the
+                                             * manager may be blocked (e.g. a
+                                             * setup-mode start that failed) */
+#define NOTIFY_SETUP_DEADLINE   (1u << 8)   /* setup_timer: setup-mode deadline
+                                             * reached (credentials stored).
+                                             * Checked before PROV_DONE in
+                                             * PROVISIONING so the cap is a
+                                             * true cap. */
 
 /* ── EventGroup bits ─────────────────────────────────────────────────────── */
 
@@ -133,7 +142,8 @@ typedef struct {
     /* Timers (all one-shot) */
     TimerHandle_t       tw_timer;       /**< Time-window hard deadline */
     TimerHandle_t       connect_timer;  /**< Per-AP connection timeout */
-    TimerHandle_t       prov_timer;     /**< BLE provisioning session timeout */
+    TimerHandle_t       prov_timer;     /**< BLE provisioning attempt timeout */
+    TimerHandle_t       setup_timer;    /**< Setup-mode deadline / grace (credentials stored) */
 
     /* Blocking-wait EventGroup */
     EventGroupHandle_t  event_group;    /**< BIT_CONNECTED | BIT_WAIT_CANCELLED */
@@ -221,6 +231,16 @@ typedef struct {
     uint8_t  held_bssid[6];          /**< AP BSSID at CRED_SUCCESS, if SSID matched */
     bool     held_valid;             /**< held_ssid/held_password populated */
     bool     held_confirmed;         /**< CRED_SUCCESS seen for the held credential */
+    /* Setup mode bookkeeping (0.4.0). setup_bounded is decided on entry to
+     * PROVISIONING: true when credentials are stored, which enables the
+     * deadline / grace / cap via setup_timer. Manager task, plus the entry
+     * paths (wifi_mgr_start_ble_provisioning() runs in the caller's task). */
+    bool       setup_bounded;
+    TickType_t setup_started;           /**< xTaskGetTickCount() at entry */
+    volatile bool ble_client_connected; /**< From PROTOCOMM_TRANSPORT_BLE_EVENT */
+    bool       setup_requested_at_boot; /**< RTC flag seen (ESP_RST_SW) in wifi_mgr_init() */
+    bool       no_trigger_hint_logged;  /**< Once-per-boot "add a setup trigger" hint */
+
     bool     driver_wipe_pending;    /**< A failed session left an unverified password
                                        *  in the driver's NVS and the wipe could not
                                        *  run (station still busy). Retried before the

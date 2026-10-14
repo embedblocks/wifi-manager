@@ -226,6 +226,21 @@ typedef enum {
 } wifi_mgr_auto_prov_t;
 
 /**
+ * @brief Wi-Fi power-save mode applied by the component.
+ *
+ * Own enum because WIFI_PS_NONE is 0 in ESP-IDF, and 0 in wifi_mgr_config_t
+ * means "use the Kconfig default".
+ */
+typedef enum {
+    WIFI_MGR_PS_DEFAULT   = 0, /**< Use CONFIG_WIFI_PS_MODE_* */
+    WIFI_MGR_PS_NONE      = 1, /**< No modem sleep: lowest receive latency,
+                                 *  highest power (audio, low-latency control) */
+    WIFI_MGR_PS_MIN_MODEM = 2, /**< ESP-IDF default: wake every DTIM; receive
+                                 *  delay up to one DTIM interval (~100-300 ms) */
+    WIFI_MGR_PS_MAX_MODEM = 3, /**< Wake per listen interval: lowest power */
+} wifi_mgr_ps_mode_t;
+
+/**
  * @brief Configuration for wifi_mgr_init().
  *
  * Set any field to 0 / NULL to use the Kconfig default.
@@ -251,6 +266,10 @@ typedef struct {
     char     device_name_prefix[16];  /**< BLE name prefix (empty → Kconfig) */
     wifi_mgr_auto_prov_t auto_provision; /**< When tw expiry may start BLE
                                             *  provisioning (DEFAULT → Kconfig) */
+    wifi_mgr_ps_mode_t   ps_mode;        /**< Wi-Fi power save (DEFAULT → Kconfig).
+                                            *  Applied after esp_wifi_start() and
+                                            *  re-applied after every provisioning
+                                            *  session. */
 } wifi_mgr_config_t;
 
 /* ── ap_info_t forward declaration for stored-AP queries ─────────────────── */
@@ -388,15 +407,66 @@ void wifi_mgr_reset_wait_cancel(void);
 /* ── Provisioning API ────────────────────────────────────────────────────── */
 
 /**
- * @brief Immediately drop the current connection (if any) and start BLE provisioning.
+ * @brief Immediately drop the current connection (if any) and start BLE
+ *        provisioning, without rebooting.
  *
  * Valid from any state except PROVISIONING (returns ESP_ERR_INVALID_STATE).
- * The tw timer is not involved — provisioning starts unconditionally.
- * Use from a factory-reset GPIO handler, a button ISR task, or similar.
+ * Prefer wifi_mgr_reboot_into_setup(): it starts from a clean heap and works
+ * the same under both CONFIG_WIFI_PROV_BT_LIFECYCLE options. Use this one
+ * only if the application must keep running.
+ *
+ * If credentials are stored, setup mode is time-limited
+ * (CONFIG_WIFI_SETUP_DEADLINE_MS, extended while a phone is connected or
+ * credentials are being tried, capped by CONFIG_WIFI_SETUP_MAX_MS); then the
+ * device returns to scanning and reconnects to a stored network. With no
+ * credentials stored it stays in setup mode until provisioning succeeds.
+ *
+ * Under CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS after a successful
+ * session this boot, BLE cannot be restarted: the call behaves like
+ * wifi_mgr_reboot_into_setup() and does not return.
  *
  * @return ESP_OK or error.
  */
 esp_err_t wifi_mgr_start_ble_provisioning(void);
+
+/**
+ * @brief Reboot and enter BLE provisioning ("Wi-Fi setup mode") on the way up.
+ *
+ * Stored networks are kept; the network added in setup is stored alongside
+ * them (an entry with the same SSID is replaced). This is the call to wire
+ * to the product's setup trigger — a button, an app command, a power-cycle
+ * gesture. The component has no GPIO code of its own; see
+ * examples/basic_provisioning for a button implementation.
+ *
+ * Mechanism: a magic value in RTC no-init memory, read and cleared by
+ * wifi_mgr_init() on every boot and honoured only after a software reset
+ * (esp_reset_reason() == ESP_RST_SW) — not after power-on, a crash or
+ * deep-sleep wakeup. wifi_mgr_start() then enters setup mode directly.
+ *
+ * Does NOT return on success (esp_restart()). To save application state
+ * first, register a handler with esp_register_shutdown_handler(); esp_restart()
+ * runs it. Callable from any task (not from an ISR), before or after
+ * wifi_mgr_init().
+ *
+ * @return Does not return.
+ */
+void wifi_mgr_reboot_into_setup(void);
+
+/**
+ * @brief Forget every stored network, then reboot into setup mode.
+ *
+ * Clears the credential store and commits the empty store to NVS before
+ * rebooting. The driver's own NVS copy is wiped by wifi_mgr_start() on the
+ * way up. If the commit fails, the function returns the error and does NOT
+ * reboot — otherwise the device would come back still holding the networks
+ * the user asked to forget.
+ *
+ * Does NOT return on success. Requires wifi_mgr_init().
+ *
+ * @return Only on failure: ESP_ERR_INVALID_STATE (not initialized) or the
+ *         NVS error from saving the empty store.
+ */
+esp_err_t wifi_mgr_forget_all_and_reboot_into_setup(void);
 
 /**
  * @brief Erase all stored credentials and restart the scan/provision cycle.

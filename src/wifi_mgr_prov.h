@@ -155,6 +155,12 @@ esp_err_t wifi_mgr_driver_wipe_config(void);
  */
 void wifi_mgr_driver_wipe_if_pending(void);
 
+/**
+ * @brief Apply CTX->config.ps_mode via esp_wifi_set_ps(). Called after
+ *        esp_wifi_start() and after every provisioning session ends.
+ */
+void wifi_mgr_driver_apply_ps(void);
+
 #ifdef __cplusplus
 }
 #endif

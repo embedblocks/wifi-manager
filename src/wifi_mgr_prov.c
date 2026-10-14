@@ -14,24 +14,25 @@
  * fix #2 below. Calling deinit from the PROV_END handler would race when
  * PROV_END fires before CRED_SUCCESS is processed.
  *
- * Fix #2 (BT controller cannot be reinitialized after deinit — the actual
- * root cause of the original "BLE_INIT: controller init failed" field
- * bug): esp_bt_controller_init() is documented by Espressif as
- * unsupported after a prior esp_bt_controller_deinit() in the same boot.
- * network_prov_mgr_deinit() triggers exactly that deinit as a side effect of
- * the NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM scheme handler used
- * here. Once that has happened, no amount of waiting or retrying makes a
- * later network_prov_mgr_init() succeed — it is a hard wall, not a
- * transient race against an async teardown task.
+ * Fix #2 (retry in place, never deinit on failure). Correction in 0.4.0:
+ * earlier versions of this comment said the BLE controller "stays
+ * initialized" between attempts and that esp_bt_controller_init() after
+ * esp_bt_controller_deinit() is the irreversible step. Both were wrong.
+ * Verified against ESP-IDF v6.0 + network_provisioning 1.3.x: every
+ * network_prov_mgr_stop_provisioning() tears the controller down
+ * (protocomm_ble_stop() -> nimble_port_deinit() ->
+ * esp_bt_controller_disable()/deinit(), unless keep_ble_on is set, which
+ * it is not), and every start initializes it again — that cycle works. The
+ * only step that cannot be undone within a boot is esp_bt_mem_release(),
+ * run by the FREE_BTDM scheme handler on NETWORK_PROV_DEINIT, i.e. by
+ * network_prov_mgr_deinit().
  *
- * The fix is to avoid the deinit/reinit cycle entirely on the
- * failure-retry path: wifi_mgr_prov_stop_failed_attempt() never
- * deinitializes, so wifi_mgr_prov_start()'s retry-in-place branch can
- * restart the existing session directly, indefinitely, without ever
- * exercising esp_bt_controller_deinit()/init() again. See
- * CTX->bt_mem_freed and CONFIG_WIFI_PROV_BT_LIFECYCLE in Kconfig for how
- * this interacts with the *success* path, where deinit (to free BT
- * memory) is sometimes still desired despite the one-way cost.
+ * So the rule that matters is: never call network_prov_mgr_deinit() on the
+ * failure path. wifi_mgr_prov_stop_failed_attempt() only stops the session;
+ * wifi_mgr_prov_start()'s retry-in-place branch restarts it without a new
+ * init. Under CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS the success path
+ * does deinit (and so releases memory); CTX->bt_mem_freed records that, and
+ * the next wifi_mgr_prov_start() reboots into setup mode instead of trying.
  *
  * Fix #3 (real-hardware-discovered: network_prov_mgr_stop_provisioning()
  * does NOT wait for BLE teardown before returning, despite running in
@@ -97,6 +98,7 @@
 #include "esp_wifi.h"
 #include "network_provisioning/manager.h"
 #include "network_provisioning/scheme_ble.h"
+#include "protocomm_ble.h"
 #include "string.h"
 #include "stdio.h"
 
@@ -243,6 +245,25 @@ static void wifi_mgr_prov_event_handler(void *arg,
     }
 }
 
+/* ── BLE client tracking ─────────────────────────────────────────────────── */
+
+/* Protocomm posts these from both the NimBLE and the Bluedroid transport.
+ * Used only to extend the setup deadline while a phone is connected
+ * (CONFIG_WIFI_SETUP_GRACE_MS). Registered with the provisioning event
+ * handler, unregistered with it. */
+static void wifi_mgr_ble_transport_handler(void *arg, esp_event_base_t base,
+                                           int32_t id, void *data)
+{
+    (void)arg; (void)base; (void)data;
+    if (id == PROTOCOMM_TRANSPORT_BLE_CONNECTED) {
+        CTX->ble_client_connected = true;
+        ESP_LOGD(TAG, "BLE client connected");
+    } else if (id == PROTOCOMM_TRANSPORT_BLE_DISCONNECTED) {
+        CTX->ble_client_connected = false;
+        ESP_LOGD(TAG, "BLE client disconnected");
+    }
+}
+
 /* ── Internal helpers ────────────────────────────────────────────────────── */
 
 /**
@@ -262,6 +283,9 @@ static void prov_mgr_safe_deinit(void)
     CTX->prov_mgr_initialized = false;
     esp_event_handler_unregister(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID,
                                  wifi_mgr_prov_event_handler);
+    esp_event_handler_unregister(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID,
+                                 wifi_mgr_ble_transport_handler);
+    CTX->ble_client_connected = false;
     network_prov_mgr_deinit();
     ESP_LOGD(TAG, "prov_mgr deinitialized");
 }
@@ -298,6 +322,21 @@ void wifi_mgr_driver_storage_ram(void)
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_set_storage(RAM) failed: %s",
                  esp_err_to_name(ret));
+    }
+}
+
+void wifi_mgr_driver_apply_ps(void)
+{
+    wifi_ps_type_t ps;
+    switch (CTX->config.ps_mode) {
+    case WIFI_MGR_PS_NONE:      ps = WIFI_PS_NONE;      break;
+    case WIFI_MGR_PS_MAX_MODEM: ps = WIFI_PS_MAX_MODEM; break;
+    case WIFI_MGR_PS_MIN_MODEM:
+    default:                    ps = WIFI_PS_MIN_MODEM; break;
+    }
+    esp_err_t ret = esp_wifi_set_ps(ps);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_ps(%d) failed: %s", (int)ps, esp_err_to_name(ret));
     }
 }
 
@@ -365,6 +404,30 @@ esp_err_t wifi_mgr_prov_start(void)
      * construction (xSemaphoreCreateBinary() default) and this take
      * simply returns pdFALSE immediately. */
     xSemaphoreTake(CTX->prov_stop_confirm_sem, 0);
+
+    /* FREE_ON_SUCCESS dead end, checked before any init/start call. After
+     * a successful session released Bluetooth memory (esp_bt_mem_release()
+     * via the FREE_BTDM scheme handler), BLE cannot start again this boot.
+     * The failure would surface inside network_prov_mgr_start_provisioning()
+     * (protocomm_ble_start() -> nimble_port_init() ->
+     * esp_bt_controller_init()), not in network_prov_mgr_init(), which only
+     * allocates configuration — 0.1.x-0.3.x checked the wrong call, so the
+     * restart never happened. Reboot through the setup flag: since 0.3.0 a
+     * device with stored credentials never provisions by itself, so a plain
+     * esp_restart() would come back connected and silently drop the setup
+     * request. Does not return. */
+    if (CTX->bt_mem_freed) {
+        ESP_LOGW(TAG, "Bluetooth memory was released earlier this boot "
+                      "(CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS) — "
+                      "rebooting into setup mode");
+        wifi_mgr_error_info_t err_info = {
+            .code               = ESP_ERR_WIFI_MGR_BT_PERMANENTLY_RELEASED,
+            .state              = WIFI_MGR_STATE_PROVISIONING,
+            .consecutive_errors = CTX->consecutive_errors,
+        };
+        wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err_info, sizeof(err_info));
+        wifi_mgr_reboot_into_setup();
+    }
 
     /* Retry-in-place: if a session already exists (survived a prior
      * failure/timeout without being deinitialized — see
@@ -508,34 +571,10 @@ esp_err_t wifi_mgr_prov_start(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "network_prov_mgr_init failed: %s", esp_err_to_name(ret));
 
-        if (CTX->bt_mem_freed) {
-            /* The dead end: BT memory was released after a prior
-             * successful FREE_ON_SUCCESS session, and esp_bt_controller_init()
-             * does not support being called again in the same boot
-             * (documented ESP-IDF limitation, not a transient fault — see
-             * WIFI_PROV_BT_LIFECYCLE in Kconfig). Retrying this call would
-             * fail identically forever. Restart instead of falling back
-             * to SCANNING, so the device comes back up with the
-             * controller available and walks the normal boot path back
-             * into PROVISIONING. */
-            ESP_LOGE(TAG, "BLE controller unavailable after prior BT memory "
-                          "release (CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS) "
-                          "— this cannot be retried in this boot. Restarting "
-                          "to recover.");
-            wifi_mgr_error_info_t err_info = {
-                .code               = ESP_ERR_WIFI_MGR_BT_PERMANENTLY_RELEASED,
-                .state              = WIFI_MGR_STATE_PROVISIONING,
-                .consecutive_errors = ++CTX->consecutive_errors,
-            };
-            wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err_info, sizeof(err_info));
-            esp_restart();
-            /* esp_restart() does not return. */
-        }
-
-        /* Not the dead end — an ordinary init failure (e.g. transient
-         * resource pressure on first-ever provisioning attempt). Recover
-         * to SCANNING as before; the existing consecutive-error backoff
-         * in 09_event_system.md governs the retry cadence from there. */
+        /* An ordinary init failure (the bt_mem_freed dead end is handled
+         * before any init/start call, at the top of this function).
+         * Recover to SCANNING; the consecutive-error backoff governs the
+         * retry cadence from there. */
         wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
         wifi_mgr_error_info_t err_info = {
             .code               = ret,
@@ -556,6 +595,14 @@ esp_err_t wifi_mgr_prov_start(void)
         wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
         return ret;
     }
+    /* Non-fatal: without it, the setup deadline simply isn't extended
+     * while a phone is connected. */
+    CTX->ble_client_connected = false;
+    if (esp_event_handler_register(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID,
+                                   wifi_mgr_ble_transport_handler, NULL) != ESP_OK) {
+        ESP_LOGW(TAG, "Could not register BLE transport handler — setup "
+                      "deadline will not extend while a phone is connected");
+    }
 
     /* Start provisioning */
     ret = network_prov_mgr_start_provisioning(security, pop,
@@ -566,6 +613,8 @@ esp_err_t wifi_mgr_prov_start(void)
                  esp_err_to_name(ret));
         esp_event_handler_unregister(NETWORK_PROV_EVENT, ESP_EVENT_ANY_ID,
                                      wifi_mgr_prov_event_handler);
+        esp_event_handler_unregister(PROTOCOMM_TRANSPORT_BLE_EVENT, ESP_EVENT_ANY_ID,
+                                     wifi_mgr_ble_transport_handler);
         network_prov_mgr_deinit();
         wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
         wifi_mgr_error_info_t err_info = {
@@ -726,6 +775,8 @@ bool wifi_mgr_prov_stop_failed_attempt(void)
                           "the next connection attempt", esp_err_to_name(wret));
         }
     }
+    CTX->ble_client_connected = false;
+    wifi_mgr_driver_apply_ps();
 
     ESP_LOGD(TAG, "Provisioning attempt stopped (session kept alive for retry)");
     return false;
@@ -744,6 +795,8 @@ void wifi_mgr_prov_stop_succeeded(void)
      * on, so nothing is pending any more. */
     wifi_mgr_driver_storage_ram();
     CTX->driver_wipe_pending = false;
+    CTX->ble_client_connected = false;
+    wifi_mgr_driver_apply_ps();
 
 #if defined(CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS)
     /* Wait for confirmed BLE teardown before deinitializing — same race

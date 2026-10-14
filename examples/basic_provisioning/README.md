@@ -132,25 +132,48 @@ factory partition via a custom partition table, or move to a two-partition
 (OTA) scheme. See `idf.py partition-table` and the ESP-IDF partition tables
 guide.
 
-## BT memory release after provisioning
+## Wi-Fi setup button
 
-`wifi_manager` already releases BT memory automatically once provisioning
-completes — no application code needed. `wifi_mgr_prov.c` configures
-`network_prov_mgr_init()` with `NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM`,
-which frees both classic Bluetooth and BLE memory (recovering roughly
-20–30 KB of heap) as soon as the provisioning manager is torn down.
+Once the device holds credentials it never enters setup mode (BLE
+provisioning) by itself, so adding a network later — device moved, router
+replaced, password changed — needs a trigger. This example uses the board's
+BOOT button (GPIO0 on ESP32/ESP32-S3, GPIO9 on ESP32-C3/C6) via
+[`espressif/button`](https://components.espressif.com/components/espressif/button),
+declared in `main/idf_component.yml`. That dependency belongs to the example
+only; `wifi_manager` itself has no GPIO code.
 
-**This is a one-way operation for the lifetime of the running firmware.**
-If the device later needs to re-enter BLE provisioning (e.g. a factory-reset
-button), a reboot is required — BT cannot be re-initialized after this
-release without one. See `L8` in `01_overview.md` for the full trade-off
-discussion.
+| Hold, then release | Action |
+|---|---|
+| ≥ 3 s | `wifi_mgr_reboot_into_setup()` — reboot into setup mode, stored networks kept |
+| ≥ 10 s | `wifi_mgr_forget_all_and_reboot_into_setup()` — forget all networks, then setup |
 
-If your product needs classic Bluetooth to keep running after WiFi
-provisioning finishes (uncommon), change the handler constant in
-`wifi_mgr_prov.c` from `NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM` to
-`NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BLE`, which frees only the BLE
-memory and leaves classic BT intact.
+The action is decided on release, so holding for 10 s never triggers the
+3 s action; the console says "release now: …" as each threshold is reached.
+Pin, polarity and hold times are under `idf.py menuconfig` →
+"basic_provisioning example". The button callbacks run in the `esp_timer`
+task, so they only hand the action to a small task (forget-all writes NVS).
+
+Holding BOOT while powering up or resetting enters the ROM download mode
+instead of the application; that is fine after boot.
+
+With credentials stored, setup mode ends after 5 min (extended while a phone
+is connected, at most 15 min) and the device goes back to its stored networks.
+
+## Bluetooth memory after provisioning
+
+Controlled by `CONFIG_WIFI_PROV_BT_LIFECYCLE`:
+
+- `KEEP_ALIVE` (default): Bluetooth memory stays reserved, so setup mode can
+  be entered again at any time without a reboot.
+- `FREE_ON_SUCCESS`: after a successful session the memory is released
+  (`esp_bt_mem_release()`, one-way per boot). Entering setup mode again in the
+  same boot reboots the device into setup mode first.
+
+The BLE controller itself is torn down after every session under both
+options; only the memory release is irreversible. Measure free internal heap
+on your target before choosing `FREE_ON_SUCCESS` (the commonly quoted saving
+of ~20–30 KB has not been measured for this component). See
+`docs/12_setup_mode.md`.
 
 ## Credential management at runtime
 

@@ -50,12 +50,65 @@
 #include "string.h"
 #include "stdio.h"
 #include "inttypes.h"
+#include "esp_attr.h"
+#include "esp_system.h"
 
 static const char *TAG = "wifi_mgr";
+
+/* Bounded wait for the station to report "not associated" when setup mode
+ * ends (end_setup_mode()). */
+#define WIFI_MGR_END_SETUP_DISCONNECT_WAIT_MS 2000
 
 /* ── Global singleton ────────────────────────────────────────────────────── */
 
 wifi_mgr_ctx_t g_wifi_mgr_ctx = {0};
+
+/* ── Reboot-into-setup flag ──────────────────────────────────────────────── */
+
+/* RTC no-init memory survives esp_restart() (and deep sleep) but holds
+ * random data after power-on, hence a 32-bit magic value rather than a bit.
+ * Read and cleared once per boot by wifi_mgr_init(), whether or not it is
+ * honoured — otherwise a flag set just before a crash (ignored: reset
+ * reason ESP_RST_PANIC) would survive and be acted on by some later,
+ * unrelated esp_restart(), e.g. after an OTA update. */
+#define WIFI_MGR_SETUP_FLAG_MAGIC 0x53455455u /* "SETU" */
+static RTC_NOINIT_ATTR uint32_t s_setup_flag;
+static bool s_setup_flag_checked;   /* once per boot (cleared by a reboot) */
+static bool s_setup_flag_pending;   /* honoured flag not yet consumed */
+
+static void setup_flag_check_once(void)
+{
+    if (s_setup_flag_checked) {
+        return;
+    }
+    s_setup_flag_checked = true;
+
+    const bool flagged = (s_setup_flag == WIFI_MGR_SETUP_FLAG_MAGIC);
+    s_setup_flag = 0;
+    const esp_reset_reason_t reason = esp_reset_reason();
+
+    s_setup_flag_pending = flagged && (reason == ESP_RST_SW);
+    if (s_setup_flag_pending) {
+        ESP_LOGI(TAG, "Setup mode requested before reboot — entering it at start");
+    } else if (flagged) {
+        ESP_LOGW(TAG, "Setup flag ignored (reset reason %d, not ESP_RST_SW)",
+                 (int)reason);
+    }
+}
+
+void wifi_mgr_reboot_into_setup(void)
+{
+    ESP_LOGW(TAG, "Rebooting into Wi-Fi setup mode");
+    s_setup_flag = WIFI_MGR_SETUP_FLAG_MAGIC;
+    esp_restart();
+}
+
+static void wake_manager_task(void)
+{
+    if (CTX->task_handle) {
+        xTaskNotify(CTX->task_handle, NOTIFY_WAKE, eSetBits);
+    }
+}
 
 /* ── Error backoff schedule ──────────────────────────────────────────────── */
 
@@ -82,6 +135,14 @@ static void connect_timer_cb(TimerHandle_t timer)
     (void)timer;
     if (CTX->task_handle) {
         xTaskNotify(CTX->task_handle, NOTIFY_CONNECT_TIMEOUT, eSetBits);
+    }
+}
+
+static void setup_timer_cb(TimerHandle_t timer)
+{
+    (void)timer;
+    if (CTX->task_handle) {
+        xTaskNotify(CTX->task_handle, NOTIFY_SETUP_DEADLINE, eSetBits);
     }
 }
 
@@ -258,6 +319,18 @@ static void on_disconnect(void)
 
     wifi_mgr_state_t current = wifi_mgr_state_get();
 
+    if (current == WIFI_MGR_STATE_PROVISIONING) {
+        /* Disconnect caused by wifi_mgr_start_ble_provisioning() dropping the
+         * link (called from another task while we were CONNECTED). Setup
+         * mode owns the state now; do not overwrite it with SCANNING —
+         * 0.1.x-0.3.x did, leaving BLE provisioning running while the
+         * manager scanned and ignored its result. */
+        CTX->connect_list_count = 0;
+        CTX->connect_list_index = 0;
+        CTX->connect_retry      = 0;
+        return;
+    }
+
     if (current == WIFI_MGR_STATE_CONNECTED && CTX->conn_info.ssid[0] != '\0') {
         /* Fast reconnect path: remember the last AP and do one immediate scan */
         strncpy(CTX->last_connected_ssid, CTX->conn_info.ssid,
@@ -291,6 +364,8 @@ static void on_disconnect(void)
  */
 static void on_prov_done(void)
 {
+    xTimerStop(CTX->setup_timer, 0);
+    CTX->setup_bounded = false;
     wifi_mgr_prov_stop_succeeded();
 
     /* The connection is confirmed (NETWORK_PROV_WIFI_CRED_SUCCESS), so the
@@ -441,6 +516,140 @@ static bool on_prov_failed(void)
     return false;
 }
 
+/* ── Setup mode (BLE provisioning) entry and deadline ────────────────────── */
+
+static uint32_t setup_max_ms(void)
+{
+    return (CONFIG_WIFI_SETUP_MAX_MS > CONFIG_WIFI_SETUP_DEADLINE_MS)
+         ? CONFIG_WIFI_SETUP_MAX_MS : CONFIG_WIFI_SETUP_DEADLINE_MS;
+}
+
+/**
+ * @brief Enter setup mode: state PROVISIONING, arm the deadline when
+ *        credentials are stored, start BLE provisioning.
+ *
+ * Single entry point for tw expiry, wifi_mgr_start_ble_provisioning() and
+ * the reboot-into-setup path. May run in the manager task or a caller's
+ * task. Does not return if Bluetooth memory was released earlier this boot
+ * (wifi_mgr_prov_start() reboots into setup).
+ */
+static esp_err_t begin_setup_mode(void)
+{
+    wifi_mgr_state_set(WIFI_MGR_STATE_PROVISIONING);
+
+    CTX->setup_bounded = (ap_records_get_count() > 0);
+    CTX->setup_started = xTaskGetTickCount();
+    if (CTX->setup_bounded) {
+        /* xTimerChangePeriod() also starts a dormant timer */
+        xTimerChangePeriod(CTX->setup_timer,
+                           pdMS_TO_TICKS(CONFIG_WIFI_SETUP_DEADLINE_MS), 0);
+        ESP_LOGI(TAG, "Setup mode: credentials stored — ends after %d ms "
+                      "(extendable to %"PRIu32" ms while in use)",
+                 CONFIG_WIFI_SETUP_DEADLINE_MS, setup_max_ms());
+    } else {
+        ESP_LOGI(TAG, "Setup mode: no credentials stored — until provisioned");
+    }
+
+    esp_err_t ret = wifi_mgr_prov_start();
+    if (ret != ESP_OK) {
+        /* prov_start() already recovered state to SCANNING and posted ERROR */
+        xTimerStop(CTX->setup_timer, 0);
+        CTX->setup_bounded = false;
+        wake_manager_task(); /* may be blocked in a wait for the old state */
+    }
+    return ret;
+}
+
+/**
+ * @brief End a bounded setup mode (deadline or hard cap) and return to
+ *        scanning. Same cleanup as a failed attempt, plus a confirmed
+ *        disconnect: an attempt in flight may have just associated (even
+ *        reached CRED_SUCCESS), and the manager must not believe it is
+ *        disconnected while the radio is connected — its next
+ *        wifi_mgr_connect_attempt() would call esp_wifi_set_config() on a
+ *        live link. Nothing from this session is saved (true cap).
+ */
+static void end_setup_mode(void)
+{
+    xTimerStop(CTX->setup_timer, 0);
+    CTX->setup_bounded = false;
+
+    /* Stops the session, discards held credentials, disconnects, wipes the
+     * driver copy (or marks it pending). Returns true if a stop is in
+     * progress — the outer loop then exits via CTX->stop_requested. */
+    if (wifi_mgr_prov_stop_failed_attempt()) {
+        return;
+    }
+
+    esp_wifi_disconnect();
+    wifi_ap_record_t ap;
+    TickType_t waited = 0;
+    const TickType_t step  = pdMS_TO_TICKS(100);
+    const TickType_t limit = pdMS_TO_TICKS(WIFI_MGR_END_SETUP_DISCONNECT_WAIT_MS);
+    while (esp_wifi_sta_get_ap_info(&ap) == ESP_OK && waited < limit) {
+        vTaskDelay(step);
+        waited += step;
+    }
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        ESP_LOGW(TAG, "Station still associated %d ms after ending setup mode",
+                 WIFI_MGR_END_SETUP_DISCONNECT_WAIT_MS);
+    }
+    wifi_mgr_driver_wipe_if_pending();
+
+    xEventGroupClearBits(CTX->event_group, BIT_CONNECTED);
+    CTX->connect_list_count = 0;
+    CTX->connect_list_index = 0;
+    CTX->connect_retry      = 0;
+
+    wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
+    wifi_mgr_events_post(WIFI_MGR_EVENT_PROVISIONING_FAILED, NULL, 0);
+    wifi_mgr_events_post(WIFI_MGR_EVENT_SCANNING, NULL, 0);
+    ESP_LOGW(TAG, "Setup mode ended (deadline) — back to scanning");
+}
+
+/**
+ * @brief Handle NOTIFY_SETUP_DEADLINE in PROVISIONING.
+ *
+ * Extends by CONFIG_WIFI_SETUP_GRACE_MS while a phone is connected or a
+ * received credential is pending (being tried, or confirmed but not yet
+ * processed), up to the hard cap. Otherwise — or at the cap — ends setup.
+ *
+ * @return true if setup ended; the caller must ignore the other bits of the
+ *         same wakeup (PROV_DONE included: the cap is a true cap).
+ */
+static bool on_setup_deadline(void)
+{
+    if (!CTX->setup_bounded ||
+        wifi_mgr_state_get() != WIFI_MGR_STATE_PROVISIONING) {
+        return false; /* stale */
+    }
+
+    const TickType_t elapsed = xTaskGetTickCount() - CTX->setup_started;
+    const TickType_t cap     = pdMS_TO_TICKS(setup_max_ms());
+    const bool in_use = CTX->ble_client_connected || CTX->held_valid;
+
+    if (in_use && elapsed < cap) {
+        TickType_t grace = pdMS_TO_TICKS(CONFIG_WIFI_SETUP_GRACE_MS);
+        if (grace > cap - elapsed) {
+            grace = cap - elapsed;
+        }
+        xTimerChangePeriod(CTX->setup_timer, grace, 0);
+        ESP_LOGI(TAG, "Setup deadline reached while in use (%s) — extended by "
+                      "%"PRIu32" ms",
+                 CTX->held_valid ? "credentials pending" : "phone connected",
+                 (uint32_t)pdTICKS_TO_MS(grace));
+        return false;
+    }
+
+    if (in_use) {
+        ESP_LOGW(TAG, "Setup mode hard maximum (%"PRIu32" ms) reached while in "
+                      "use — ending; nothing from this session is saved",
+                 setup_max_ms());
+    }
+    end_setup_mode();
+    return true;
+}
+
 /* ── tw expiry ───────────────────────────────────────────────────────────── */
 
 /**
@@ -484,11 +693,8 @@ static void start_provisioning_on_tw_expiry(void)
                  esp_err_to_name(disc_ret));
     }
 
-    wifi_mgr_state_set(WIFI_MGR_STATE_PROVISIONING);
-
-    esp_err_t ret = wifi_mgr_prov_start();
+    esp_err_t ret = begin_setup_mode();
     if (ret != ESP_OK) {
-        /* prov_start() already recovered state to SCANNING and posted ERROR */
         ESP_LOGE(TAG, "BLE provisioning start failed: %s", esp_err_to_name(ret));
     }
 }
@@ -549,6 +755,15 @@ static bool on_tw_expired(void)
     ESP_LOGI(TAG, "tw expired; auto-provisioning not allowed (policy %d, %d "
                   "stored APs) — re-arming window and continuing",
              (int)CTX->config.auto_provision, ap_records_get_count());
+    if (!CTX->no_trigger_hint_logged && ap_records_get_count() > 0) {
+        CTX->no_trigger_hint_logged = true; /* once per boot */
+        ESP_LOGW(TAG, "No stored network is reachable. This device will not "
+                      "enter setup mode by itself while it holds credentials. "
+                      "To add a network, the application must call "
+                      "wifi_mgr_reboot_into_setup() (or "
+                      "wifi_mgr_start_ble_provisioning()) — e.g. from a setup "
+                      "button. See README, 'Integration checklist'.");
+    }
     wifi_mgr_tw_window_reset();
     xTimerStart(CTX->tw_timer, 0);
     return false;
@@ -724,8 +939,27 @@ static void manager_task(void *arg)
                 continue;
             }
 
-            xTaskNotifyWait(0, UINT32_MAX, &notif, pdMS_TO_TICKS(scan_watchdog_ms));
+            /* Wait for SCAN_DONE, bounded by the scan watchdog. Unrelated
+             * bits (stale timer bits, NOTIFY_WAKE) neither abort the scan
+             * nor count as the watchdog; if another task moved the state
+             * away from SCANNING, stop waiting and re-dispatch. */
+            {
+                const TickType_t wd_ticks = pdMS_TO_TICKS(scan_watchdog_ms);
+                const TickType_t t0 = xTaskGetTickCount();
+                for (;;) {
+                    TickType_t elapsed = xTaskGetTickCount() - t0;
+                    if (elapsed >= wd_ticks) { notif = 0; break; }
+                    notif = 0;
+                    xTaskNotifyWait(0, UINT32_MAX, &notif, wd_ticks - elapsed);
+                    if (notif & (NOTIFY_STOP | NOTIFY_SCAN_DONE)) break;
+                    if (wifi_mgr_state_get() != WIFI_MGR_STATE_SCANNING) break;
+                }
+            }
             if (notif & NOTIFY_STOP) goto cleanup;
+            if (!(notif & NOTIFY_SCAN_DONE) &&
+                wifi_mgr_state_get() != WIFI_MGR_STATE_SCANNING) {
+                continue; /* state changed under us; scan finishes on its own */
+            }
 
             if (notif & NOTIFY_SCAN_DONE) {
                 wifi_mgr_scan_handle_results();
@@ -917,6 +1151,11 @@ static void manager_task(void *arg)
                 continue;
             }
 
+            /* Not SCAN_DONE: if another task changed the state (e.g. setup
+             * mode was started), don't overwrite it. */
+            if (wifi_mgr_state_get() != WIFI_MGR_STATE_RESCAN_ONCE) {
+                continue;
+            }
             /* Watchdog: scan hung in RESCAN_ONCE */
             ESP_LOGW(TAG, "Scan watchdog in RESCAN_ONCE — clearing last AP and returning to SCANNING");
             esp_wifi_scan_stop();
@@ -931,6 +1170,10 @@ static void manager_task(void *arg)
         if (state == WIFI_MGR_STATE_PROVISIONING) {
             xTaskNotifyWait(0, UINT32_MAX, &notif, portMAX_DELAY);
             if (notif & NOTIFY_STOP)        goto cleanup;
+            /* Deadline first: if it ends setup mode, a PROV_DONE in the same
+             * wakeup is ignored (true cap; end_setup_mode() has already
+             * stopped the session and confirmed the station disconnected). */
+            if ((notif & NOTIFY_SETUP_DEADLINE) && on_setup_deadline()) continue;
             if (notif & NOTIFY_PROV_DONE)   { on_prov_done();   continue; }
             if (notif & NOTIFY_PROV_FAILED) { if (on_prov_failed()) goto cleanup; continue; }
             /* NOTIFY_CONNECTED and NOTIFY_DISCONNECTED are silently discarded
@@ -1000,10 +1243,30 @@ esp_err_t wifi_mgr_init(const wifi_mgr_config_t *config)
         CTX->config.auto_provision = WIFI_MGR_AUTO_PROV_WHEN_UNPROVISIONED;
 #endif
     }
+    if (CTX->config.ps_mode == WIFI_MGR_PS_DEFAULT) {
+#if defined(CONFIG_WIFI_PS_MODE_NONE)
+        CTX->config.ps_mode = WIFI_MGR_PS_NONE;
+#elif defined(CONFIG_WIFI_PS_MODE_MAX_MODEM)
+        CTX->config.ps_mode = WIFI_MGR_PS_MAX_MODEM;
+#else
+        CTX->config.ps_mode = WIFI_MGR_PS_MIN_MODEM;
+#endif
+    }
+#if defined(CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS)
+    if (CTX->config.auto_provision == WIFI_MGR_AUTO_PROV_ALWAYS) {
+        ESP_LOGW(TAG, "auto_provision=ALWAYS with WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS: "
+                      "during a long router outage every automatic setup mode "
+                      "costs a reboot (about one every few minutes). See the "
+                      "Kconfig help of both options.");
+    }
+#endif
     if (CTX->config.device_name_prefix[0] == '\0')
         strncpy(CTX->config.device_name_prefix,
                 CONFIG_WIFI_PROV_DEVICE_NAME_PREFIX,
                 sizeof(CTX->config.device_name_prefix) - 1);
+
+    /* Read and clear the reboot-into-setup flag (once per boot). */
+    setup_flag_check_once();
 
     /* Initialize ap_records (loads credentials from NVS internally) */
     esp_err_t ret = ap_records_init();
@@ -1034,6 +1297,11 @@ esp_err_t wifi_mgr_init(const wifi_mgr_config_t *config)
                                        pdMS_TO_TICKS(CTX->config.connect_timeout_ms),
                                        pdFALSE, NULL, connect_timer_cb);
     if (!CTX->connect_timer) goto oom;
+
+    CTX->setup_timer = xTimerCreate("setup_timer",
+                                     pdMS_TO_TICKS(CONFIG_WIFI_SETUP_DEADLINE_MS),
+                                     pdFALSE, NULL, setup_timer_cb);
+    if (!CTX->setup_timer) goto oom;
 
     /* prov_timer period irrelevant when timeout == 0 (never started) */
     uint32_t prov_period = (CTX->config.prov_timeout_ms > 0)
@@ -1073,6 +1341,7 @@ oom:
     ret = ESP_ERR_NO_MEM;
 cleanup_timers:
     if (CTX->prov_timer)    { xTimerDelete(CTX->prov_timer, 0);    CTX->prov_timer    = NULL; }
+    if (CTX->setup_timer)   { xTimerDelete(CTX->setup_timer, 0);   CTX->setup_timer   = NULL; }
     if (CTX->connect_timer) { xTimerDelete(CTX->connect_timer, 0); CTX->connect_timer = NULL; }
     if (CTX->tw_timer)      { xTimerDelete(CTX->tw_timer, 0);      CTX->tw_timer      = NULL; }
     if (CTX->prov_stop_confirm_sem) { vSemaphoreDelete(CTX->prov_stop_confirm_sem); CTX->prov_stop_confirm_sem = NULL; }
@@ -1180,6 +1449,10 @@ esp_err_t wifi_mgr_start(void)
         return ret;
     }
 
+    /* Power save. The application must not call esp_wifi_set_ps() itself;
+     * wifi_mgr_prov.c re-applies this after every provisioning session. */
+    wifi_mgr_driver_apply_ps();
+
     /* Build provisioning device name (stored for later use by prov_start) */
     uint8_t mac[6];
     esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -1189,6 +1462,15 @@ esp_err_t wifi_mgr_start(void)
     snprintf(CTX->prov_device_name, sizeof(CTX->prov_device_name),
              "%s%02X%02X%02X", prefix, mac[3], mac[4], mac[5]);
 
+    /* Reboot-into-setup: consume the request before anything can fail or
+     * crash, so a crash during setup cannot re-enter it on the next boot.
+     * The initial state is set before the task exists, so the task never
+     * observes IDLE and never starts a scan it would have to abandon. */
+    const bool boot_setup = s_setup_flag_pending;
+    s_setup_flag_pending = false;
+    wifi_mgr_state_set(boot_setup ? WIFI_MGR_STATE_PROVISIONING
+                                  : WIFI_MGR_STATE_SCANNING);
+
     /* Create manager task */
     BaseType_t task_ret = xTaskCreate(manager_task, "wifi_mgr",
                                        CONFIG_WIFI_TASK_STACK_SIZE,
@@ -1197,6 +1479,7 @@ esp_err_t wifi_mgr_start(void)
                                        &CTX->task_handle);
     if (task_ret != pdPASS) {
         ESP_LOGE(TAG, "xTaskCreate failed");
+        wifi_mgr_state_set(WIFI_MGR_STATE_IDLE);
         esp_wifi_stop();
         esp_wifi_deinit();
         esp_netif_destroy_default_wifi(CTX->sta_netif);
@@ -1205,10 +1488,15 @@ esp_err_t wifi_mgr_start(void)
     }
 
     CTX->started = true;
-    wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
     wifi_mgr_events_post(WIFI_MGR_EVENT_STARTED, NULL, 0);
 
     ESP_LOGI(TAG, "wifi_manager started — device: %s", CTX->prov_device_name);
+
+    if (boot_setup) {
+        /* On failure begin_setup_mode() has recovered to SCANNING and woken
+         * the task; start itself still succeeded. */
+        begin_setup_mode();
+    }
     return ESP_OK;
 }
 
@@ -1220,6 +1508,9 @@ esp_err_t wifi_mgr_stop(void)
 
     /* Step 1 */
     CTX->stop_requested = true;
+
+    xTimerStop(CTX->setup_timer, 0);
+    CTX->setup_bounded = false;
 
     /* Step 2: stop provisioning if active */
     if (wifi_mgr_state_get() == WIFI_MGR_STATE_PROVISIONING) {
@@ -1284,6 +1575,7 @@ esp_err_t wifi_mgr_deinit(void)
 
     /* Delete timers */
     if (CTX->prov_timer)    { xTimerDelete(CTX->prov_timer, 0);    CTX->prov_timer    = NULL; }
+    if (CTX->setup_timer)   { xTimerDelete(CTX->setup_timer, 0);   CTX->setup_timer   = NULL; }
     if (CTX->connect_timer) { xTimerDelete(CTX->connect_timer, 0); CTX->connect_timer = NULL; }
     if (CTX->tw_timer)      { xTimerDelete(CTX->tw_timer, 0);      CTX->tw_timer      = NULL; }
 
@@ -1394,8 +1686,29 @@ esp_err_t wifi_mgr_start_ble_provisioning(void)
         esp_wifi_disconnect();
     }
 
-    wifi_mgr_state_set(WIFI_MGR_STATE_PROVISIONING);
-    return wifi_mgr_prov_start();
+    return begin_setup_mode();
+}
+
+esp_err_t wifi_mgr_forget_all_and_reboot_into_setup(void)
+{
+    if (!CTX->initialized) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t ret = ap_records_clear_all();
+    if (ret == ESP_OK) {
+        ret = ap_records_save();
+    }
+    if (ret != ESP_OK) {
+        /* Do not reboot: the device would come back still holding the
+         * networks the user asked to forget. Restore RAM from NVS so this
+         * boot matches what is stored, and report the error. */
+        ESP_LOGE(TAG, "Forget-all failed to commit (%s) — not rebooting",
+                 esp_err_to_name(ret));
+        ap_records_load();
+        return ret;
+    }
+    ESP_LOGW(TAG, "All stored networks forgotten");
+    wifi_mgr_reboot_into_setup(); /* does not return */
+    return ESP_OK;
 }
 
 esp_err_t wifi_mgr_reset_provisioning(void)

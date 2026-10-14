@@ -1,0 +1,4 @@
+## Example-only dependency: the Wi-Fi setup button.
+## wifi_manager itself has no GPIO code and does not depend on this.
+dependencies:
+  espressif/button: "^4.2.1"

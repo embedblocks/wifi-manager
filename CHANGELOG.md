@@ -6,6 +6,80 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.0] — Wi-Fi setup trigger and power save
+
+### Added
+- `wifi_mgr_reboot_into_setup()`: reboot straight into BLE provisioning
+  ("setup mode"), keeping stored networks. The call to wire to a product's
+  setup trigger (button, app command, power-cycle gesture). Uses a magic
+  value in RTC no-init memory, read and cleared by `wifi_mgr_init()` on
+  every boot and honoured only after a software reset (not after power-on,
+  a crash or deep-sleep wakeup). Does not return.
+- `wifi_mgr_forget_all_and_reboot_into_setup()`: forget every network,
+  commit the empty store to NVS, then reboot into setup mode. On a commit
+  failure it restores RAM from NVS, returns the error and does not reboot.
+- Setup-mode deadline when credentials are stored:
+  `CONFIG_WIFI_SETUP_DEADLINE_MS` (300 s), extended by
+  `CONFIG_WIFI_SETUP_GRACE_MS` (60 s) while a phone is connected over BLE
+  or received credentials are pending, capped by `CONFIG_WIFI_SETUP_MAX_MS`
+  (15 min). Failed attempts restart in place inside the deadline. At the
+  end: session stopped, held credentials discarded, station confirmed
+  disconnected, driver copy wiped, back to scanning. Nothing from a session
+  ended this way is saved, even if it connects at that moment. With no
+  credentials stored, setup mode lasts until provisioning succeeds, as
+  before.
+- `ps_mode` (`CONFIG_WIFI_PS_MODE`, `wifi_mgr_config_t.ps_mode`,
+  `wifi_mgr_ps_mode_t`): applied after `esp_wifi_start()` and after every
+  provisioning session.
+- Once-per-boot log hint, when no stored network is reachable, that the
+  application must provide a setup trigger. README "Integration checklist".
+- Example: Wi-Fi setup button in `examples/basic_provisioning`, built on
+  `espressif/button` (example-only dependency): BOOT button by default; hold
+  3 s = setup, 10 s = forget all, decided on release; callbacks hand the
+  action to a task because they run in the `esp_timer` task.
+- Example README: the Bluetooth memory section described the release as
+  automatic; it only happens under `FREE_ON_SUCCESS` (not the default).
+
+### Fixed
+- **`FREE_ON_SUCCESS` never rebooted when BLE was needed again.** The
+  `bt_mem_freed` check ran only when `network_prov_mgr_init()` failed,
+  which it never does; the failure surfaces in
+  `network_prov_mgr_start_provisioning()`. The check now runs before either
+  call, and the reboot goes through the setup flag — a plain
+  `esp_restart()` would have come back connected (a provisioned device
+  never provisions by itself since 0.3.0), silently dropping the request.
+- **`wifi_mgr_start_ble_provisioning()` from CONNECTED broke setup mode.**
+  The resulting disconnect made `on_disconnect()` overwrite PROVISIONING
+  with SCANNING, so the manager scanned while BLE provisioning ran and
+  ignored its result. `on_disconnect()` now leaves PROVISIONING alone.
+- A setup-mode start that failed in the caller's task could leave the
+  manager task blocked in a wait for the old state. It is now woken.
+- In SCANNING and RESCAN_ONCE, an unrelated notification during a scan
+  could be taken for the scan watchdog (aborting the scan, or overwriting
+  a state set by another task). Both now keep waiting or re-dispatch.
+- The manager task could briefly observe the IDLE state at start-up.
+
+### Changed
+- Bluetooth lifecycle help text and code comments corrected: the BLE
+  controller is torn down at every session stop under both options; only
+  `esp_bt_mem_release()` is irreversible. `KEEP_ALIVE` keeps memory
+  reserved, not the controller running. Behaviour unchanged.
+- `WIFI_PROV_TIMEOUT_MS` now limits each attempt; with credentials stored
+  the setup deadline limits the whole setup mode (whichever ends first).
+- `auto_provision = ALWAYS` with `FREE_ON_SUCCESS` logs a start-up warning
+  (one reboot per automatic setup mode during an outage).
+
+### Migration
+- Recompile: `wifi_mgr_config_t` grew `ps_mode`.
+- Wire `wifi_mgr_reboot_into_setup()` to a trigger (see the Integration
+  checklist).
+- If you called `esp_wifi_set_ps()` yourself, use `ps_mode` instead —
+  the component re-applies its own setting after provisioning.
+- A manually started setup on a provisioned device now ends after the
+  deadline instead of retrying forever.
+
+---
+
 ## [0.3.1] — Review fixes for 0.3.0
 
 ### Fixed

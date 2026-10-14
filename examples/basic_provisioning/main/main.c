@@ -6,7 +6,7 @@
  *   2. Register a wifi_manager event handler to log state transitions
  *   3. wifi_mgr_init() + wifi_mgr_start()
  *   4. Block in a network task until connected, then do work
- *   5. Optional: release BT controller after provisioning (provision-once)
+ *   5. A Wi-Fi setup button wired to wifi_mgr_reboot_into_setup()
  *
  * Build and flash:
  *   idf.py -C examples/basic_provisioning build flash monitor
@@ -15,6 +15,14 @@
  *   Install "ESP BLE Prov" app (Android/iOS). The device advertises as
  *   "PROV_<last3MAC>". Follow the app wizard to enter WiFi credentials.
  *   On subsequent boots the device reconnects automatically.
+ *
+ * Adding a network later (moved, new router, changed password):
+ *   A device that already holds credentials never enters setup mode by
+ *   itself. Hold the Wi-Fi setup button (default: the board's BOOT button)
+ *   for 3 s and release to reboot into setup mode, keeping stored networks;
+ *   hold 10 s and release to forget all networks first. The component has
+ *   no GPIO code — this button is application code; copy and adapt it, or
+ *   wire wifi_mgr_reboot_into_setup() to any other trigger you have.
  */
 
 #include <stdio.h>
@@ -26,6 +34,9 @@
 #include "esp_log.h"
 #include "lwip/ip4_addr.h"
 #include "wifi_manager.h"
+#include "iot_button.h"
+#include "button_gpio.h"
+#include "sdkconfig.h"
 
 static const char *TAG = "EXAMPLE";
 
@@ -176,6 +187,110 @@ static void network_task(void *arg)
  * app_main
  * ------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------
+ * Wi-Fi setup button (application code, not part of the component)
+ *
+ * Uses espressif/button (example dependency only; wifi_manager has no GPIO
+ * code). BUTTON_LONG_PRESS_UP with several press_time thresholds calls only
+ * the callback for the longest threshold reached, on release — so the 3 s
+ * action can never fire before the user reaches 10 s. BUTTON_LONG_PRESS_START
+ * with the same thresholds fires while still held: used here to tell the
+ * user which action releasing will take (a product would blink an LED).
+ *
+ * espressif/button runs its callbacks in the esp_timer task, which must
+ * stay short. Forget-all writes NVS before rebooting, so the callbacks only
+ * hand the action to setup_action_task.
+ *
+ * Note for products using the BOOT button: holding it while powering up or
+ * resetting enters the ROM download mode instead of the application. That
+ * is fine after boot; say so in the user manual.
+ * ------------------------------------------------------------------------- */
+
+#if CONFIG_EXAMPLE_FORGET_HOLD_MS > 0 && \
+    CONFIG_EXAMPLE_FORGET_HOLD_MS <= CONFIG_EXAMPLE_SETUP_HOLD_MS
+#error "EXAMPLE_FORGET_HOLD_MS must be longer than EXAMPLE_SETUP_HOLD_MS (or 0 to disable)"
+#endif
+
+enum { ACTION_SETUP = 1, ACTION_FORGET_ALL = 2 };
+static TaskHandle_t s_setup_action_task;
+
+static void setup_action_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        uint32_t action = 0;
+        xTaskNotifyWait(0, UINT32_MAX, &action, portMAX_DELAY);
+        if (action == ACTION_FORGET_ALL) {
+            esp_err_t err = wifi_mgr_forget_all_and_reboot_into_setup();
+            /* Only returns on failure (networks NOT forgotten). */
+            ESP_LOGE(TAG, "[button] forget-all failed: %s", esp_err_to_name(err));
+        } else if (action == ACTION_SETUP) {
+            wifi_mgr_reboot_into_setup(); /* does not return */
+        }
+    }
+}
+
+/* Callbacks: esp_timer task context — keep them short. */
+static void on_release_setup(void *btn, void *ctx)
+{
+    xTaskNotify(s_setup_action_task, ACTION_SETUP, eSetValueWithOverwrite);
+}
+static void on_hold_setup(void *btn, void *ctx)
+{
+    ESP_LOGW(TAG, "[button] release now: Wi-Fi setup (networks kept)");
+}
+#if CONFIG_EXAMPLE_FORGET_HOLD_MS > 0
+static void on_release_forget(void *btn, void *ctx)
+{
+    xTaskNotify(s_setup_action_task, ACTION_FORGET_ALL, eSetValueWithOverwrite);
+}
+static void on_hold_forget(void *btn, void *ctx)
+{
+    ESP_LOGW(TAG, "[button] release now: FORGET ALL networks, then setup");
+}
+#endif
+
+static void setup_button_init(void)
+{
+    xTaskCreate(setup_action_task, "setup_act", 3072, NULL,
+                tskIDLE_PRIORITY + 2, &s_setup_action_task);
+
+    const button_config_t btn_cfg = {
+        /* Long-press detection starts at the first threshold. */
+        .long_press_time = CONFIG_EXAMPLE_SETUP_HOLD_MS,
+    };
+    const button_gpio_config_t gpio_cfg = {
+        .gpio_num     = CONFIG_EXAMPLE_SETUP_BUTTON_GPIO,
+        .active_level = CONFIG_EXAMPLE_SETUP_BUTTON_ACTIVE_LOW ? 0 : 1,
+    };
+    button_handle_t btn = NULL;
+    ESP_ERROR_CHECK(iot_button_new_gpio_device(&btn_cfg, &gpio_cfg, &btn));
+
+    /* Register thresholds in ascending press_time order: the library walks
+     * them in registration order. */
+    button_event_args_t setup_args = {
+        .long_press.press_time = CONFIG_EXAMPLE_SETUP_HOLD_MS,
+    };
+    ESP_ERROR_CHECK(iot_button_register_cb(btn, BUTTON_LONG_PRESS_START,
+                                           &setup_args, on_hold_setup, NULL));
+    ESP_ERROR_CHECK(iot_button_register_cb(btn, BUTTON_LONG_PRESS_UP,
+                                           &setup_args, on_release_setup, NULL));
+#if CONFIG_EXAMPLE_FORGET_HOLD_MS > 0
+    button_event_args_t forget_args = {
+        .long_press.press_time = CONFIG_EXAMPLE_FORGET_HOLD_MS,
+    };
+    ESP_ERROR_CHECK(iot_button_register_cb(btn, BUTTON_LONG_PRESS_START,
+                                           &forget_args, on_hold_forget, NULL));
+    ESP_ERROR_CHECK(iot_button_register_cb(btn, BUTTON_LONG_PRESS_UP,
+                                           &forget_args, on_release_forget, NULL));
+#endif
+
+    ESP_LOGI(TAG, "Wi-Fi setup button on GPIO %d: hold %d ms = setup, "
+                  "%d ms = forget all (0 = off)",
+             CONFIG_EXAMPLE_SETUP_BUTTON_GPIO, CONFIG_EXAMPLE_SETUP_HOLD_MS,
+             CONFIG_EXAMPLE_FORGET_HOLD_MS);
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "basic_provisioning example starting");
@@ -216,7 +331,11 @@ void app_main(void)
     ESP_ERROR_CHECK(wifi_mgr_start());
     ESP_LOGI(TAG, "WiFi manager started");
 
-    /* 6. Spawn network task — it blocks until connected, then does work */
+    /* 6. Wi-Fi setup button — the application's trigger for adding a
+     *    network once credentials are stored */
+    setup_button_init();
+
+    /* 7. Spawn network task — it blocks until connected, then does work */
     xTaskCreate(network_task, "net_task",
                 4096, NULL,
                 tskIDLE_PRIORITY + 1, NULL);

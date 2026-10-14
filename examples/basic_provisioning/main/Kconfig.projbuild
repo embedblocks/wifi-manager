@@ -1,0 +1,36 @@
+menu "basic_provisioning example"
+
+    config EXAMPLE_SETUP_BUTTON_GPIO
+        int "Wi-Fi setup button GPIO"
+        default 9 if IDF_TARGET_ESP32C3 || IDF_TARGET_ESP32C6
+        default 18
+        range 0 48
+        help
+            GPIO of the Wi-Fi setup button. Defaults to the BOOT button of
+            common dev boards (GPIO0 on ESP32/ESP32-S3, GPIO9 on
+            ESP32-C3/C6). The BOOT button works fine as an input after boot;
+            holding it during power-up enters the ROM download mode.
+
+    config EXAMPLE_SETUP_BUTTON_ACTIVE_LOW
+        bool "Button pulls the pin low when pressed"
+        default y
+
+    config EXAMPLE_SETUP_HOLD_MS
+        int "Hold time for Wi-Fi setup (ms)"
+        default 3000
+        range 500 30000
+        help
+            Releasing after at least this long reboots into Wi-Fi setup
+            mode (wifi_mgr_reboot_into_setup()); stored networks are kept.
+
+    config EXAMPLE_FORGET_HOLD_MS
+        int "Hold time to forget all networks (ms, 0 = disabled)"
+        default 10000
+        range 0 60000
+        help
+            Releasing after at least this long forgets every stored network
+            and reboots into setup mode
+            (wifi_mgr_forget_all_and_reboot_into_setup()). Must be longer
+            than the setup hold time.
+
+endmenu

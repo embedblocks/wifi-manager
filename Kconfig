@@ -104,11 +104,23 @@ menu "WiFi Manager"
                 stored-credential count is checked when tw expires, so
                 removing every credential re-enables it.
 
+                To add a network to a device that already has credentials
+                (moved, router replaced, password changed), the application
+                must call wifi_mgr_reboot_into_setup() from its own setup
+                trigger — a button, an app command, a power-cycle gesture.
+
         config WIFI_AUTO_PROVISION_ALWAYS
             bool "On every tw expiry (0.1.x / 0.2.x behaviour)"
             help
                 Kept for compatibility. Not recommended for devices that
-                stay installed: see the WHEN_UNPROVISIONED help text.
+                stay installed: see the WHEN_UNPROVISIONED help text. With
+                credentials stored, each automatic setup mode is limited by
+                WIFI_SETUP_DEADLINE_MS, so a router outage alternates between
+                scanning and setup mode instead of staying in setup mode.
+
+                Do not combine with WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS:
+                each automatic setup mode then costs a reboot (see that
+                option's help text).
 
         config WIFI_AUTO_PROVISION_NEVER
             bool "Never — only via wifi_mgr_start_ble_provisioning()"
@@ -205,105 +217,109 @@ menu "WiFi Manager"
             name. E.g. "PROV_" + "AABBCC" = "PROV_AABBCC".
 
     config WIFI_PROV_TIMEOUT_MS
-        int "Provisioning session timeout in milliseconds (0 = no timeout)"
+        int "Provisioning attempt timeout in milliseconds (0 = no timeout)"
         default 120000
         range 0 600000
         help
-            How long a single BLE provisioning session (one advertise/connect
-            attempt by the operator) can run before that attempt is
-            considered failed. On expiry, provisioning restarts immediately
-            for another attempt — it does NOT revert to SCANNING. The
-            device stays in PROVISIONING and keeps retrying indefinitely
-            until credentials are received successfully, or the operator
-            power-cycles the device. Set to 0 to disable the per-session
-            timeout entirely (a single session then runs forever until
-            credentials are received or a hard error occurs).
+            How long one BLE provisioning attempt (one advertise/connect
+            cycle) may run before it is counted as failed and restarted in
+            place.
 
-            This changed from earlier versions of this component, which
-            reverted to SCANNING on timeout. See WIFI_PROV_BT_LIFECYCLE
-            below for why: re-entering PROVISIONING from SCANNING would
-            require tearing down and re-initializing the BLE controller,
-            which is not reliably supported by the underlying esp_bt
-            controller layer (esp_bt_controller_init() is documented by
-            Espressif as unsupported after a prior esp_bt_controller_deinit()
-            in the same boot). Retrying the existing session in place avoids
-            that controller teardown/reinit cycle altogether.
+            How this relates to the setup deadline:
+            - No credentials stored: only this timeout applies. Attempts
+              restart in place until provisioning succeeds.
+            - Credentials stored: this limits each attempt, and an expired
+              attempt restarts in place; WIFI_SETUP_DEADLINE_MS limits the
+              whole setup mode. Whichever ends first wins. The deadline also
+              applies when this value is 0.
+
+    config WIFI_SETUP_DEADLINE_MS
+        int "Setup mode deadline when credentials are stored (ms)"
+        default 300000
+        range 30000 3600000
+        help
+            When the device already holds credentials, setup mode (BLE
+            provisioning entered via wifi_mgr_reboot_into_setup(),
+            wifi_mgr_start_ble_provisioning() or tw expiry) ends after this
+            long and the device returns to scanning, reconnecting to a stored
+            network. Prevents an accidental or abandoned setup request from
+            leaving a working device in setup mode.
+
+            Failed attempts (wrong password, attempt timeout) inside the
+            deadline restart in place, so a typo does not end setup mode.
+            Has no effect when no credentials are stored.
+
+    config WIFI_SETUP_GRACE_MS
+        int "Setup deadline extension while in use (ms)"
+        default 60000
+        range 10000 600000
+        help
+            If the setup deadline is reached while a phone is connected over
+            BLE, or while received credentials are being tried, the deadline
+            is extended by this much (repeatedly), up to WIFI_SETUP_MAX_MS.
+
+    config WIFI_SETUP_MAX_MS
+        int "Setup mode hard maximum when credentials are stored (ms)"
+        default 900000
+        range 30000 7200000
+        help
+            Absolute cap on setup mode when credentials are stored, including
+            grace extensions. Values below WIFI_SETUP_DEADLINE_MS are raised
+            to it at run time.
+
+            At the cap, setup ends even if an attempt is in progress: the
+            received credentials are discarded (nothing is saved, even if the
+            connection succeeds at that moment), the station is disconnected
+            and confirmed disconnected, the driver's copy is wiped, and the
+            device returns to scanning.
 
     choice WIFI_PROV_BT_LIFECYCLE
-        prompt "BLE controller lifecycle policy"
+        prompt "Bluetooth memory after successful provisioning"
         default WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE
         help
-            Controls what happens to the BLE controller and the
-            network_prov_mgr instance after provisioning, and governs how
-            failed/timed-out provisioning attempts are retried.
+            What happens to Bluetooth memory after a successful provisioning
+            session.
 
-            Background: esp_bt_controller_deinit() is documented by
-            Espressif as not fully reversible within a single boot —
-            esp_bt_controller_init() is not supported after a prior
-            deinit. Calling network_prov_mgr_deinit() with the
-            NETWORK_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM scheme handler
-            (used by this component) triggers exactly that deinit as a
-            side effect. So once BT memory has been freed in a given
-            boot, a later attempt to re-enter BLE provisioning in the
-            same boot will fail at esp_bt_controller_init() every time —
-            this is a hard wall, not a transient fault.
+            Background (verified against ESP-IDF v6.0 + network_provisioning
+            1.3.x with NimBLE and Bluedroid): the BLE controller is NOT kept
+            running between sessions under either option. Every session stop
+            tears it down (protocomm_ble_stop() -> nimble_port_deinit() ->
+            esp_bt_controller_disable()/deinit()), and every session start
+            initializes it again; that cycle is supported. The one step that
+            cannot be undone within a boot is esp_bt_mem_release(), which
+            returns the memory reserved for Bluetooth to the heap. After it,
+            BLE cannot be started again until a reboot.
 
-            Provisioning *failures and timeouts* are handled identically
-            under both policies below: the existing network_prov_mgr session
-            is never torn down on failure, only restarted in place
-            (network_prov_mgr_start_provisioning() called again without an
-            intervening init/deinit cycle), so failed attempts retry
-            indefinitely without ever touching the controller
-            teardown/reinit path that triggers the wall above. The two
-            policies differ only in what happens after a *successful*
-            provisioning session completes.
+            Earlier versions of this help text said the controller "stays
+            initialized" under KEEP_ALIVE and that controller deinit/reinit
+            was the irreversible step. Both were wrong; behaviour is unchanged.
 
         config WIFI_PROV_BT_LIFECYCLE_KEEP_ALIVE
-            bool "Keep BLE controller initialized after success (recommended default)"
+            bool "Keep Bluetooth memory reserved (recommended default)"
             help
-                On successful provisioning, network_prov_mgr and the BLE
-                controller are left initialized rather than deinitialized.
-                BT memory (~20-30 KB) remains reserved for the rest of the
-                boot. If the device ever needs to re-enter BLE provisioning
-                later in the same boot (credentials revoked, a factory
-                reset button, repeated connect failures), it can do so
-                immediately with no restart required, since the controller
-                was never torn down.
-
-                Recommended unless you have measured and confirmed you
-                need the ~20-30 KB back — e.g. on ESP32-S3/PSRAM-equipped
-                variants this RAM is rarely worth the loss of
-                no-reboot re-provisioning. See L8 in 01_overview.md for
-                the original rationale behind freeing this memory, written
-                before this lifecycle choice existed.
+                Bluetooth memory stays reserved for the rest of the boot, so
+                setup mode can be entered again at any time without a reboot.
+                Costs the reserved memory (documented as ~20-30 KB; measure
+                free internal heap on your target before deciding).
 
         config WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS
-            bool "Free BLE controller memory after success (requires restart to re-provision)"
+            bool "Release Bluetooth memory after success (re-entering setup reboots)"
             help
-                On successful provisioning, network_prov_mgr is deinitialized
-                and the BLE controller / BT memory (~20-30 KB) is released
-                back to the heap for the rest of the boot's normal
-                operation. Choose this only if you have confirmed your
-                application needs that RAM (e.g. heavy TLS/HTTPS buffers,
-                audio processing) on a memory-constrained variant without
-                PSRAM.
+                After a successful session, network_prov_mgr is
+                deinitialized and the FREE_BTDM scheme handler calls
+                esp_bt_mem_release(), returning the reserved memory to the
+                heap for the rest of the boot.
 
-                Trade-off: if BLE provisioning is ever needed again later
-                in the same boot (credentials revoked, factory reset
-                button, repeated connect failures with stored credentials),
-                esp_bt_controller_init() will fail every time, since the
-                controller cannot be reinitialized after this release
-                (documented ESP-IDF limitation, not a bug in this
-                component). This component detects that specific failure
-                signature and calls esp_restart() automatically rather
-                than retrying a call that cannot succeed — the device
-                comes back up fresh, with the controller available again,
-                and walks the normal SCANNING -> TW_ACTIVE -> PROVISIONING
-                path. This means re-provisioning after a successful
-                FREE_ON_SUCCESS session costs one automatic restart; this
-                is an intentional, contained "reboot tax" in exchange for
-                the freed memory during normal operation, not a failure
-                state to debug.
+                Any later entry into setup mode in the same boot reboots the
+                device first, through the same mechanism as
+                wifi_mgr_reboot_into_setup(), so it comes back up directly in
+                setup mode.
+
+                Do not combine with WIFI_AUTO_PROVISION_ALWAYS: during a long
+                router outage the device would cycle tw expiry -> reboot into
+                setup -> setup deadline -> scanning -> tw expiry, i.e. one
+                reboot every few minutes for as long as the router is down.
+                A warning is logged at start-up if both are selected.
     endchoice
 
     config WIFI_PROV_BLE_RETRY_BACKOFF_MS
@@ -363,5 +379,30 @@ menu "WiFi Manager"
             to throttle NVS write frequency. NVS writes block ~10-20ms.
             Lower values persist use_count changes more frequently at the
             cost of more frequent NVS writes. See L3 in 01_overview.md.
+
+    choice WIFI_PS_MODE
+        prompt "Wi-Fi power save"
+        default WIFI_PS_MODE_MIN_MODEM
+        help
+            Applied after esp_wifi_start() and re-applied after every
+            provisioning session. Runtime override: wifi_mgr_config_t.ps_mode.
+            Applications using this component should not call
+            esp_wifi_set_ps() themselves.
+
+        config WIFI_PS_MODE_NONE
+            bool "None (lowest latency)"
+            help
+                No modem sleep. Lowest receive latency, highest power. Use
+                for audio and other latency-sensitive traffic.
+        config WIFI_PS_MODE_MIN_MODEM
+            bool "Minimum modem sleep (ESP-IDF default)"
+            help
+                Wakes every DTIM. Incoming data can wait up to one DTIM
+                interval (typically ~100-300 ms).
+        config WIFI_PS_MODE_MAX_MODEM
+            bool "Maximum modem sleep (lowest power)"
+            help
+                Wakes per listen interval. Longest receive delay.
+    endchoice
 
 endmenu

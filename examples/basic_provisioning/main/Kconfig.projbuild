@@ -3,7 +3,7 @@ menu "basic_provisioning example"
     config EXAMPLE_SETUP_BUTTON_GPIO
         int "Wi-Fi setup button GPIO"
         default 9 if IDF_TARGET_ESP32C3 || IDF_TARGET_ESP32C6
-        default 0
+        default 18
         range 0 48
         help
             GPIO of the Wi-Fi setup button. Defaults to the BOOT button of

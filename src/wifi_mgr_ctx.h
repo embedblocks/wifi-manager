@@ -221,6 +221,11 @@ typedef struct {
     uint8_t  held_bssid[6];          /**< AP BSSID at CRED_SUCCESS, if SSID matched */
     bool     held_valid;             /**< held_ssid/held_password populated */
     bool     held_confirmed;         /**< CRED_SUCCESS seen for the held credential */
+    bool     driver_wipe_pending;    /**< A failed session left an unverified password
+                                       *  in the driver's NVS and the wipe could not
+                                       *  run (station still busy). Retried before the
+                                       *  next connect attempt, at the next session end
+                                       *  and at start-up. See wifi_mgr_prov.c. */
 
     /* Lifecycle guards */
     bool     initialized;

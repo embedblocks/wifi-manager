@@ -523,7 +523,10 @@ static bool on_tw_expired(void)
         return false;
     }
 
-    if (CTX->tw_known_seen) {
+    /* tw_attempts > 0 also counts: after a soft re-arm the window's
+     * tw_known_seen is cleared, but attempts may continue from the existing
+     * connect_list without a fresh scan setting it again. */
+    if (CTX->tw_known_seen || CTX->tw_attempts > 0) {
         wifi_mgr_known_ap_unreachable_t info;
         memset(&info, 0, sizeof(info));
         strncpy(info.ssid, CTX->tw_last_ssid, sizeof(info.ssid) - 1);
@@ -767,11 +770,22 @@ static void manager_task(void *arg)
                     xTaskNotifyWait(0, UINT32_MAX, &notif, portMAX_DELAY);
                     if (notif & NOTIFY_STOP) goto cleanup;
                     if (notif & NOTIFY_TW_EXPIRED) {
-                        if ((notif & NOTIFY_CONNECTED) && !auto_provision_allowed()) {
+                        const bool soft = !auto_provision_allowed();
+                        if ((notif & NOTIFY_CONNECTED) && soft) {
                             /* Expiry and IP in the same wakeup, and the
                              * deadline is soft: the connection wins and the
                              * expiry is moot (tw stopped just below). No
                              * KNOWN_AP_UNREACHABLE for an AP that connected. */
+                        } else if (soft &&
+                                   (notif & (NOTIFY_CONNECT_TIMEOUT | NOTIFY_DISCONNECTED))) {
+                            /* Expiry and this attempt's failure together:
+                             * record the failure first, so it is counted in
+                             * the window that is ending (reason included),
+                             * not carried into the re-armed one. */
+                            on_connect_failure((notif & NOTIFY_DISCONNECTED)
+                                               ? CTX->disconnect_reason : 0);
+                            on_tw_expired();
+                            break;
                         } else if (on_tw_expired()) {
                             break; /* hard deadline: provisioning started (D4) */
                         }
@@ -1133,7 +1147,9 @@ esp_err_t wifi_mgr_start(void)
         if (esp_wifi_get_config(WIFI_IF_STA, &stored) == ESP_OK &&
             stored.sta.ssid[0] != '\0') {
             ESP_LOGI(TAG, "Wiping STA config stored in driver NVS");
-            wifi_mgr_driver_wipe_config();
+            CTX->driver_wipe_pending = (wifi_mgr_driver_wipe_config() != ESP_OK);
+        } else {
+            CTX->driver_wipe_pending = false;
         }
     }
 

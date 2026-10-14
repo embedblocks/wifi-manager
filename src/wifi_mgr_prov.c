@@ -321,6 +321,18 @@ esp_err_t wifi_mgr_driver_wipe_config(void)
     return ret;
 }
 
+void wifi_mgr_driver_wipe_if_pending(void)
+{
+    if (!CTX->driver_wipe_pending) {
+        return;
+    }
+    if (wifi_mgr_driver_wipe_config() == ESP_OK) {
+        CTX->driver_wipe_pending = false;
+        ESP_LOGI(TAG, "Deferred driver config wipe completed");
+    }
+    /* else: stays pending; tried again at the next safe point */
+}
+
 void wifi_mgr_prov_wipe_held_creds(void)
 {
     /* volatile pointer so the compiler cannot elide the password wipe */
@@ -606,6 +618,12 @@ esp_err_t wifi_mgr_prov_start(void)
  * being coarse enough not to busy-poll meaningfully. */
 #define WIFI_PROV_STOP_CONFIRM_POLL_MS 100
 
+/* Retry window for the driver-config wipe after a failed session, while
+ * esp_wifi_set_config() reports ESP_ERR_WIFI_STATE (disconnect still in
+ * progress). After that the wipe is deferred via CTX->driver_wipe_pending. */
+#define WIFI_DRIVER_WIPE_RETRY_MS      1000
+#define WIFI_DRIVER_WIPE_RETRY_STEP_MS 100
+
 bool wifi_mgr_prov_stop_failed_attempt(void)
 {
     xTimerStop(CTX->prov_timer, 0);
@@ -675,14 +693,39 @@ bool wifi_mgr_prov_stop_failed_attempt(void)
 
     /* Session failed: whatever arrived was never verified. Drop it from
      * RAM, and overwrite the copy network_provisioning wrote into the
-     * driver's NVS at CRED_RECV. The station is not connected on this
-     * path; disconnect first anyway so a connect still in flight inside
-     * the provisioning manager cannot make esp_wifi_set_config() fail with
-     * ESP_ERR_WIFI_STATE. The resulting STA_DISCONNECTED is ignored in
-     * PROVISIONING. wifi_mgr_driver_wipe_config() also restores RAM mode. */
+     * driver's NVS at CRED_RECV.
+     *
+     * esp_wifi_disconnect() is asynchronous, so the overwrite can still
+     * hit a busy station and fail with ESP_ERR_WIFI_STATE. Also: while its
+     * state is >= CRED_RECV (including STOPPING), network_provisioning
+     * reconnects on unexpected disconnect reasons when wifi_conn_attempts
+     * == 0 (manager.c, reason switch, `default:` branch) — and
+     * WIFI_REASON_ASSOC_LEAVE, which our own disconnect produces, is one of
+     * them. Normally the NETWORK_PROV_END wait above has already returned
+     * it to IDLE, where the handler does nothing; if that wait timed out, it
+     * may restart a connection under us. Hence: retry briefly, then leave a
+     * pending flag that wifi_mgr_driver_wipe_if_pending() clears at the next
+     * safe point (before the next connect attempt, next session end,
+     * start-up). wifi_mgr_driver_wipe_config() always ends in RAM mode. The
+     * resulting STA_DISCONNECTED is ignored in PROVISIONING. */
     wifi_mgr_prov_wipe_held_creds();
     esp_wifi_disconnect();
-    wifi_mgr_driver_wipe_config();
+    {
+        esp_err_t wret = wifi_mgr_driver_wipe_config();
+        TickType_t waited = 0;
+        const TickType_t step  = pdMS_TO_TICKS(WIFI_DRIVER_WIPE_RETRY_STEP_MS);
+        const TickType_t limit = pdMS_TO_TICKS(WIFI_DRIVER_WIPE_RETRY_MS);
+        while (wret == ESP_ERR_WIFI_STATE && waited < limit && !CTX->stop_requested) {
+            vTaskDelay(step);
+            waited += step;
+            wret = wifi_mgr_driver_wipe_config();
+        }
+        CTX->driver_wipe_pending = (wret != ESP_OK);
+        if (CTX->driver_wipe_pending) {
+            ESP_LOGW(TAG, "Driver config wipe deferred (%s) — will retry before "
+                          "the next connection attempt", esp_err_to_name(wret));
+        }
+    }
 
     ESP_LOGD(TAG, "Provisioning attempt stopped (session kept alive for retry)");
     return false;
@@ -696,8 +739,11 @@ void wifi_mgr_prov_stop_succeeded(void)
     /* CRED_RECV left the driver in FLASH mode. Restore RAM mode so later
      * reconnects don't write to flash. The driver-stored config is not
      * wiped here — the station is connected, and it holds the verified
-     * credential; the next wifi_mgr_start() wipes it. */
+     * credential; the next wifi_mgr_start() wipes it. This session's
+     * CRED_RECV overwrote any unverified copy a deferred wipe was waiting
+     * on, so nothing is pending any more. */
     wifi_mgr_driver_storage_ram();
+    CTX->driver_wipe_pending = false;
 
 #if defined(CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS)
     /* Wait for confirmed BLE teardown before deinitializing — same race

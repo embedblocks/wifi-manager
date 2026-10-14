@@ -60,14 +60,14 @@ component is designed around those cases.
 Requires **ESP-IDF v6.0 or later**. (v0.1.x supports ESP-IDF v5.x.)
 
 ```bash
-idf.py add-dependency "embedblocks/wifi-manager^0.3.0"
+idf.py add-dependency "embedblocks/wifi-manager^0.3.1"
 ```
 
 Or in `idf_component.yml`:
 
 ```yaml
 dependencies:
-  embedblocks/wifi-manager: "^0.3.0"
+  embedblocks/wifi-manager: "^0.3.1"
 ```
 
 `espressif/network_provisioning` (the registry replacement for the

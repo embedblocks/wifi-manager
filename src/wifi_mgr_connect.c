@@ -8,6 +8,7 @@
 #include "wifi_mgr_connect.h"
 #include "wifi_mgr_ctx.h"
 #include "wifi_mgr_events.h"
+#include "wifi_mgr_prov.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
 #include "string.h"
@@ -17,6 +18,13 @@ static const char *TAG = "wifi_mgr";
 void wifi_mgr_connect_attempt(void)
 {
     const ap_info_t *ap = &CTX->connect_list[CTX->connect_list_index];
+
+    /* Safe point for a deferred wipe of an unverified password left in the
+     * driver's NVS by a failed provisioning session: the station is not
+     * connected here, and this is normally seconds after the failure — the
+     * only safe point that comes soon on a device that then resumes normal
+     * operation for weeks. Costs nothing when nothing is pending. */
+    wifi_mgr_driver_wipe_if_pending();
 
     /* Build wifi_config from stored credential */
     wifi_config_t wifi_cfg;

@@ -147,6 +147,14 @@ void wifi_mgr_driver_storage_ram(void);
  */
 esp_err_t wifi_mgr_driver_wipe_config(void);
 
+/**
+ * @brief Run a deferred driver-config wipe if one is pending
+ *        (CTX->driver_wipe_pending). Call only while the station is idle —
+ *        wifi_mgr_connect_attempt() calls it before configuring the attempt.
+ *        Stays pending on failure.
+ */
+void wifi_mgr_driver_wipe_if_pending(void);
+
 #ifdef __cplusplus
 }
 #endif

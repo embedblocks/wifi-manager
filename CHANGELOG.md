@@ -6,6 +6,30 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.3.1] — Review fixes for 0.3.0
+
+### Fixed
+- **The driver-config wipe after a failed session could fail silently**,
+  leaving an unverified password in the driver's NVS (`nvs.net80211`).
+  `esp_wifi_disconnect()` is asynchronous, so `esp_wifi_set_config()` could
+  return `ESP_ERR_WIFI_STATE`. In addition, while its state is ≥ CRED_RECV
+  (including STOPPING), network_provisioning reconnects on unexpected
+  disconnect reasons when `wifi_conn_attempts == 0` — including
+  `WIFI_REASON_ASSOC_LEAVE` from our own disconnect — which matters if the
+  `NETWORK_PROV_END` wait timed out. The wipe now retries for up to 1 s;
+  if it still fails it is deferred and retried before the next connection
+  attempt (normally seconds later, and the only early safe point on a
+  device that then resumes normal operation for weeks), at the next
+  session end and at start-up.
+- `KNOWN_AP_UNREACHABLE` could be reported as `NO_KNOWN_AP_IN_TW`: after a
+  re-armed window, attempts continuing from the existing connect list
+  without a fresh scan did not count as "known AP seen". Attempts now count.
+- When the window expired in the same wakeup as an attempt's failure, the
+  failure was recorded in the new window. The failure is now recorded
+  first, so the event reports it and the new window starts clean.
+
+---
+
 ## [0.3.0] — Provisioning safety
 
 ### Fixed

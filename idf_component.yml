@@ -1,4 +1,4 @@
-version: "0.4.0"
+version: "0.4.1"
 description: >
   WiFi lifecycle manager for ESP-IDF. Handles scanning, credential-based
   reconnection, and BLE provisioning as a single owned component — including
@@ -9,8 +9,11 @@ description: >
 url: "https://github.com/embedblocks/wifi-manager"
 
 dependencies:
-  idf: ">=6.0.0"
-  # Replaces the wifi_provisioning component that ESP-IDF v6.0 removed.
+  # Tested on ESP-IDF v5.5.2 and v6.0.3. network_provisioning itself
+  # supports IDF >= 5.1; lower this only after testing.
+  idf: ">=5.5.0"
+  # Replaces the built-in wifi_provisioning component (removed in ESP-IDF
+  # v6.0, still present in v5.x but no longer used by this component).
   # 1.2.5+ carries the SSID/password overread fix and the correct
   # NETWORK_PROV_WIFI_CRED_FAIL reason codes.
   espressif/network_provisioning: "^1.2.5"

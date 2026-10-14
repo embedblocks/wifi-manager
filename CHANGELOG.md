@@ -6,6 +6,21 @@ Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.4.1] — ESP-IDF v5.5 support
+
+### Changed
+- **ESP-IDF v5.5 is supported again**, in addition to v6.0:
+  `idf: ">=5.5.0"` (was `">=6.0.0"`). The 0.2.0 switch to
+  `espressif/network_provisioning` was never v6-specific — that component
+  supports IDF >= 5.1 — only the manifest constraint was. Tested on v5.5.2
+  (built and run on hardware) and v6.0.3. No code changes; 0.1.x users on
+  v5.5 can upgrade directly.
+- README, Kconfig help and docs: version requirement updated to v5.5+; note
+  on excluding the built-in `wifi_provisioning` on v5.x if an application
+  also uses it.
+
+---
+
 ## [0.4.0] — Wi-Fi setup trigger and power save
 
 ### Added

@@ -140,8 +140,9 @@ menu "WiFi Manager"
             BLE Prov app / esp_prov script prompts the operator for before
             it will accept WiFi credentials.
 
-            ESP-IDF v6.0 note: protocomm security versions 0 and 1 are
-            disabled by default in v6.0. Each option below automatically
+            ESP-IDF note: protocomm security versions 0 and 1 are
+            disabled by default since v6.0 (v5.x enables them). Each option
+            below automatically
             selects the matching CONFIG_ESP_PROTOCOMM_SUPPORT_SECURITY_VERSION_x
             symbol; without it, network_prov_mgr_start_provisioning() fails
             at runtime with ESP_ERR_NOT_SUPPORTED and no log output.
@@ -280,7 +281,7 @@ menu "WiFi Manager"
             What happens to Bluetooth memory after a successful provisioning
             session.
 
-            Background (verified against ESP-IDF v6.0 + network_provisioning
+            Background (verified against ESP-IDF v6.0.3 + network_provisioning
             1.3.x with NimBLE and Bluedroid): the BLE controller is NOT kept
             running between sessions under either option. Every session stop
             tears it down (protocomm_ble_stop() -> nimble_port_deinit() ->

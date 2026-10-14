@@ -1,6 +1,6 @@
 # wifi-manager
 
-![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v6.0-blue)
+![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.5%20%7C%20v6.0-blue)
 ![Espressif Component Registry](https://img.shields.io/badge/Espressif-Component%20Registry-orange)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
@@ -57,22 +57,29 @@ component is designed around those cases.
 
 ## Installation
 
-Requires **ESP-IDF v6.0 or later**. (v0.1.x supports ESP-IDF v5.x.)
+Requires **ESP-IDF v5.5 or later** — tested on v5.5.2 and v6.0.3. Users of
+0.1.x on ESP-IDF v5.5 can move to this version directly.
 
 ```bash
-idf.py add-dependency "embedblocks/wifi-manager^0.4.0"
+idf.py add-dependency "embedblocks/wifi-manager^0.4.1"
 ```
 
 Or in `idf_component.yml`:
 
 ```yaml
 dependencies:
-  embedblocks/wifi-manager: "^0.4.0"
+  embedblocks/wifi-manager: "^0.4.1"
 ```
 
 `espressif/network_provisioning` (the registry replacement for the
 `wifi_provisioning` component that ESP-IDF v6.0 removed) is pulled in
-automatically as a transitive dependency.
+automatically as a transitive dependency, on v5.5 as well as v6.0.
+
+On ESP-IDF v5.x, if your application *also* uses the built-in
+`wifi_provisioning` component directly, add
+`set(EXCLUDE_COMPONENTS wifi_provisioning)` to your project's
+`CMakeLists.txt` or move that code to `network_provisioning` too
+(Espressif's migration guide recommends this when both are present).
 
 ---
 

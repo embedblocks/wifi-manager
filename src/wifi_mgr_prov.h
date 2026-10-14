@@ -122,6 +122,31 @@ void wifi_mgr_prov_stop_succeeded(void);
  */
 void wifi_mgr_prov_stop_shutdown(void);
 
+/**
+ * @brief Wipe the provisioned credential held in RAM (password zeroed with
+ *        a non-elidable write). Manager task / stop paths only.
+ */
+void wifi_mgr_prov_wipe_held_creds(void);
+
+/**
+ * @brief Put the Wi-Fi driver back in WIFI_STORAGE_RAM.
+ *
+ * network_provisioning leaves it in WIFI_STORAGE_FLASH after every
+ * start_provisioning() call and after receiving credentials. Only affects
+ * where future esp_wifi_set_config() calls are written; safe while connected.
+ */
+void wifi_mgr_driver_storage_ram(void);
+
+/**
+ * @brief Overwrite the driver's NVS-stored STA config with an empty one,
+ *        ending in WIFI_STORAGE_RAM.
+ *
+ * Call only while the station is not connected or connecting (after a
+ * failed provisioning session, or in wifi_mgr_start() before
+ * esp_wifi_start()). Failure is logged and non-fatal.
+ */
+esp_err_t wifi_mgr_driver_wipe_config(void);
+
 #ifdef __cplusplus
 }
 #endif

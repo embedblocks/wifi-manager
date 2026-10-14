@@ -136,10 +136,31 @@ bool wifi_mgr_scan_handle_results(void)
     ap_info_t known_list[CONFIG_MAX_AP_COUNT];
     uint8_t   known_count = 0;
 
+    static const uint8_t zero_bssid[6] = {0};
     for (uint8_t i = 0; i < stored_count; i++) {
         for (uint16_t j = 0; j < count; j++) {
             if (ap_matches(&stored_snapshot[i], &scan_buf[j])) {
-                known_list[known_count++] = stored_snapshot[i];
+                known_list[known_count] = stored_snapshot[i];
+
+                /* BSSID lock only when that exact BSSID is in this scan.
+                 * In a mesh / multi-AP home the stored radio may be off;
+                 * locking to it would waste the first attempt. The
+                 * zeroing applies to this connect_list copy only — the
+                 * stored record keeps its BSSID. */
+                ap_info_t *k = &known_list[known_count];
+                if (memcmp(k->bssid, zero_bssid, 6) != 0) {
+                    bool bssid_seen = false;
+                    for (uint16_t m = 0; m < count; m++) {
+                        if (memcmp(k->bssid, scan_buf[m].bssid, 6) == 0) {
+                            bssid_seen = true;
+                            break;
+                        }
+                    }
+                    if (!bssid_seen) {
+                        memset(k->bssid, 0, sizeof(k->bssid));
+                    }
+                }
+                known_count++;
                 break; /* don't add the same stored AP twice */
             }
         }
@@ -165,9 +186,12 @@ bool wifi_mgr_scan_handle_results(void)
         /* Start tw_timer exactly once per TW_ACTIVE entry.
          * Do NOT restart if already TW_ACTIVE — that would extend the hard deadline. */
         if (state == WIFI_MGR_STATE_SCANNING) {
+            wifi_mgr_tw_window_reset();
             xTimerStart(CTX->tw_timer, 0);
             wifi_mgr_state_set(WIFI_MGR_STATE_TW_ACTIVE);
         }
+        /* Remembered for tw expiry: KNOWN_AP_UNREACHABLE vs NO_KNOWN_AP_IN_TW */
+        CTX->tw_known_seen = true;
 
         wifi_mgr_events_post(WIFI_MGR_EVENT_LIVE_APS_FOUND,
                              &result, sizeof(result));
@@ -179,6 +203,7 @@ bool wifi_mgr_scan_handle_results(void)
                          &result, sizeof(result));
 
     if (state == WIFI_MGR_STATE_SCANNING) {
+        wifi_mgr_tw_window_reset();
         xTimerStart(CTX->tw_timer, 0);
         wifi_mgr_state_set(WIFI_MGR_STATE_TW_ACTIVE);
         return true; /* state changed */

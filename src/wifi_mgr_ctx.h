@@ -24,6 +24,7 @@
 #include <stdbool.h>
 #include "esp_netif.h"
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -202,8 +203,24 @@ typedef struct {
     /* Scan truncation warning — emitted at most once per state entry */
     bool     scan_truncation_warned; /**< Cleared by wifi_mgr_state_set() */
 
-    /* Deferred NVS save — set when provisioning receives credentials */
-    bool     pending_nvs_save;
+    /* Per-tw-window bookkeeping (reset by wifi_mgr_tw_window_reset() each
+     * time a window starts or is re-armed). Read when tw expires to choose
+     * between NO_KNOWN_AP_IN_TW and KNOWN_AP_UNREACHABLE. Manager task only. */
+    bool     tw_known_seen;          /**< A stored AP was visible in this window */
+    uint16_t tw_attempts;            /**< Connection attempts made in this window */
+    uint16_t tw_last_reason;         /**< Last failure reason (0 = connect timeout) */
+    char     tw_last_ssid[33];       /**< SSID of the last attempt */
+
+    /* Provisioned credentials held in RAM until the connection is confirmed.
+     * Written by the NETWORK_PROV_WIFI_CRED_RECV / _CRED_SUCCESS handlers
+     * (event task) strictly before NOTIFY_PROV_DONE is sent; consumed and
+     * wiped by on_prov_done() (manager task). Wiped on CRED_FAIL, timeout
+     * and shutdown. Nothing reaches ap_records until CRED_SUCCESS. */
+    char     held_ssid[33];
+    char     held_password[65];
+    uint8_t  held_bssid[6];          /**< AP BSSID at CRED_SUCCESS, if SSID matched */
+    bool     held_valid;             /**< held_ssid/held_password populated */
+    bool     held_confirmed;         /**< CRED_SUCCESS seen for the held credential */
 
     /* Lifecycle guards */
     bool     initialized;
@@ -217,6 +234,17 @@ extern wifi_mgr_ctx_t g_wifi_mgr_ctx;
 
 /* Convenience alias used throughout the implementation. */
 #define CTX (&g_wifi_mgr_ctx)
+
+/* Start a fresh tw window's bookkeeping. Call whenever tw_timer is (re)started:
+ * on TW_ACTIVE entry (wifi_mgr_scan.c) and on a soft re-arm (on_tw_expired()).
+ * Manager task only. */
+static inline void wifi_mgr_tw_window_reset(void)
+{
+    CTX->tw_known_seen  = false;
+    CTX->tw_attempts    = 0;
+    CTX->tw_last_reason = 0;
+    memset(CTX->tw_last_ssid, 0, sizeof(CTX->tw_last_ssid));
+}
 
 #ifdef __cplusplus
 }

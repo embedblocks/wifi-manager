@@ -42,7 +42,13 @@ void wifi_mgr_connect_attempt(void)
     esp_err_t ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(ret));
-        /* connect_timer not started; caller will treat timeout as failure */
+        /* Still arm connect_timer: the manager task waits for an outcome
+         * with portMAX_DELAY, and without the timer this attempt would
+         * never produce one. The timeout then takes the normal failure
+         * path (retry / next AP). */
+        xTimerChangePeriod(CTX->connect_timer,
+                           pdMS_TO_TICKS(CTX->config.connect_timeout_ms), 0);
+        xTimerStart(CTX->connect_timer, 0);
         return;
     }
 

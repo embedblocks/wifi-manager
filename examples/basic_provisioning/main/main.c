@@ -75,12 +75,27 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     }
 
     case WIFI_MGR_EVENT_NO_KNOWN_AP_IN_TW:
-        ESP_LOGW(TAG, "[wifi] Time window expired — starting BLE provisioning");
-        ESP_LOGW(TAG, "[wifi] Open 'ESP BLE Prov' app and follow the wizard");
+        /* Since 0.3.0 this no longer implies provisioning is starting:
+         * under the default auto_provision policy a device that already
+         * has credentials just keeps scanning. Watch PROVISIONING_STARTED. */
+        ESP_LOGW(TAG, "[wifi] Time window expired — no stored network visible");
         break;
+
+    case WIFI_MGR_EVENT_KNOWN_AP_UNREACHABLE: {
+        /* A stored network is in range but every attempt failed — often a
+         * changed router password. The component never re-provisions on
+         * its own for this (a look-alike AP causes the same failures);
+         * a real product would prompt the user here and call
+         * wifi_mgr_start_ble_provisioning() on their confirmation. */
+        wifi_mgr_known_ap_unreachable_t *u = data;
+        ESP_LOGW(TAG, "[wifi] '%s' visible but unreachable (%u attempts, last reason %u)",
+                 u->ssid, u->attempts, u->last_reason);
+        break;
+    }
 
     case WIFI_MGR_EVENT_PROVISIONING_STARTED:
         ESP_LOGI(TAG, "[wifi] BLE provisioning active — waiting for credentials");
+        ESP_LOGI(TAG, "[wifi] Open 'ESP BLE Prov' app and follow the wizard");
         break;
 
     case WIFI_MGR_EVENT_PROVISIONING_DONE:

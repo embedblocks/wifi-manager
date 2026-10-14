@@ -11,7 +11,7 @@
  *  - on_connect_success() / on_connect_failure() / on_disconnect()
  *  - on_prov_done() / on_prov_failed()
  *  - on_rescan_once_result()
- *  - handle_tw_expired()
+ *  - on_tw_expired() / start_provisioning_on_tw_expiry()
  *  - All public API functions
  *
  * Design constraints enforced here:
@@ -199,10 +199,11 @@ static void on_connect_success(void)
  * Advances through retry → next AP → rescan logic.
  * All connect-tracking fields are owned by the manager task; no mutex needed.
  */
-static void on_connect_failure(void)
+static void on_connect_failure(uint16_t reason)
 {
     xTimerStop(CTX->connect_timer, 0);
     esp_wifi_disconnect(); /* ensure driver is in clean state */
+    CTX->tw_last_reason = reason; /* 0 = connect_timeout_ms expired */
 
     CTX->connect_retry++;
     if (CTX->connect_retry < CTX->config.max_connect_attempts) {
@@ -292,10 +293,21 @@ static void on_prov_done(void)
 {
     wifi_mgr_prov_stop_succeeded();
 
-    if (CTX->pending_nvs_save) {
-        esp_err_t ret = ap_records_save();
+    /* The connection is confirmed (NETWORK_PROV_WIFI_CRED_SUCCESS), so the
+     * held credential is now proven and may enter ap_records. It gets
+     * use_count = max + 1 inside ap_records_add() and is tried first next
+     * time. The BSSID is the AP actually joined (zeros if the SSID did not
+     * match); it is only used as a lock when seen in a fresh scan. */
+    if (CTX->held_confirmed) {
+        static const uint8_t zero_bssid[6] = {0};
+        const uint8_t *bssid = memcmp(CTX->held_bssid, zero_bssid, 6) != 0
+                             ? CTX->held_bssid : NULL;
+        esp_err_t ret = ap_records_add(CTX->held_ssid, CTX->held_password, bssid);
+        if (ret == ESP_OK) {
+            ret = ap_records_save();
+        }
         if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "ap_records_save after provisioning failed: %s",
+            ESP_LOGE(TAG, "Saving provisioned credential failed: %s",
                      esp_err_to_name(ret));
             wifi_mgr_error_info_t err_info = {
                 .code               = ret,
@@ -303,9 +315,20 @@ static void on_prov_done(void)
                 .consecutive_errors = CTX->consecutive_errors,
             };
             wifi_mgr_events_post(WIFI_MGR_EVENT_ERROR, &err_info, sizeof(err_info));
-            /* State still transitions to CONNECTED — credential is in RAM. */
+            /* State still transitions to CONNECTED — the link is up. */
         }
-        CTX->pending_nvs_save = false;
+    } else {
+        ESP_LOGW(TAG, "Provisioning reported success without a held credential "
+                      "— nothing saved");
+    }
+    wifi_mgr_prov_wipe_held_creds();
+
+    /* conn_info.channel was never filled on the provisioning path
+     * (on_connect_success() does it for the normal path). */
+    uint8_t primary = 0;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    if (esp_wifi_get_channel(&primary, &second) == ESP_OK) {
+        CTX->conn_info.channel = primary;
     }
 
     wifi_mgr_state_set(WIFI_MGR_STATE_CONNECTED);
@@ -418,17 +441,37 @@ static bool on_prov_failed(void)
     return false;
 }
 
-/* ── tw_expired handler ──────────────────────────────────────────────────── */
+/* ── tw expiry ───────────────────────────────────────────────────────────── */
 
 /**
- * @brief Handle tw deadline expiry: abort any in-progress activity and start BLE.
+ * @brief Whether tw expiry may start BLE provisioning right now.
+ *
+ * Evaluated at expiry, not at TW_ACTIVE entry, so credentials added or
+ * removed during the window are taken into account.
+ */
+static bool auto_provision_allowed(void)
+{
+    switch (CTX->config.auto_provision) {
+    case WIFI_MGR_AUTO_PROV_ALWAYS:
+        return true;
+    case WIFI_MGR_AUTO_PROV_NEVER:
+        return false;
+    case WIFI_MGR_AUTO_PROV_WHEN_UNPROVISIONED:
+    default:
+        return ap_records_get_count() <= 0;
+    }
+}
+
+/**
+ * @brief Hard-deadline path: abort whatever is in progress and start BLE.
  *
  * tw expiry wins unconditionally (D4 in 02_state_machine.md). If NOTIFY_CONNECTED
- * and NOTIFY_TW_EXPIRED both arrive in the same xTaskNotifyWait call, TW_EXPIRED
- * has higher bit priority and the IP is discarded in favour of BLE provisioning.
- * This is the correct trade-off: a clean hard deadline over an unbounded race.
+ * and NOTIFY_TW_EXPIRED both arrive in the same xTaskNotifyWait call, the IP
+ * is discarded in favour of provisioning. Only reached when
+ * auto_provision_allowed() — under the default policy that means no
+ * credentials are stored, so there is no "good" connection to lose.
  */
-static void handle_tw_expired(void)
+static void start_provisioning_on_tw_expiry(void)
 {
     xTimerStop(CTX->tw_timer, 0);
     xTimerStop(CTX->connect_timer, 0);
@@ -442,13 +485,70 @@ static void handle_tw_expired(void)
     }
 
     wifi_mgr_state_set(WIFI_MGR_STATE_PROVISIONING);
-    wifi_mgr_events_post(WIFI_MGR_EVENT_NO_KNOWN_AP_IN_TW, NULL, 0);
 
     esp_err_t ret = wifi_mgr_prov_start();
     if (ret != ESP_OK) {
         /* prov_start() already recovered state to SCANNING and posted ERROR */
         ESP_LOGE(TAG, "BLE provisioning start failed: %s", esp_err_to_name(ret));
     }
+}
+
+/**
+ * @brief Handle NOTIFY_TW_EXPIRED.
+ *
+ * Reports what the window saw (KNOWN_AP_UNREACHABLE if a stored AP was
+ * visible, NO_KNOWN_AP_IN_TW otherwise), then either starts provisioning
+ * (hard deadline) or re-arms the window and lets the caller carry on.
+ *
+ * Soft path guarantees: no esp_wifi_disconnect(), no scan abort, and the
+ * caller must still act on any other bits in the same notification — in
+ * particular a NOTIFY_CONNECTED that arrived together with the expiry.
+ *
+ * A stale expiry bit (timer fired just before scan results moved the state
+ * back to SCANNING) is ignored outright: provisioning is never started
+ * without live APs (R7), and the window must not be re-armed outside
+ * TW_ACTIVE.
+ *
+ * @return true  if provisioning was started (state is now PROVISIONING, or
+ *               SCANNING if the start failed) — caller must abandon its
+ *               current wait and `continue` the outer loop.
+ *         false if the bit was stale or the window was re-armed — caller
+ *               continues what it was doing, ignoring the expiry bit.
+ */
+static bool on_tw_expired(void)
+{
+    if (wifi_mgr_state_get() != WIFI_MGR_STATE_TW_ACTIVE) {
+        ESP_LOGD(TAG, "Stale tw expiry ignored (state %s)",
+                 wifi_mgr_state_str(wifi_mgr_state_get()));
+        return false;
+    }
+
+    if (CTX->tw_known_seen) {
+        wifi_mgr_known_ap_unreachable_t info;
+        memset(&info, 0, sizeof(info));
+        strncpy(info.ssid, CTX->tw_last_ssid, sizeof(info.ssid) - 1);
+        info.last_reason = CTX->tw_last_reason;
+        info.attempts    = CTX->tw_attempts;
+        wifi_mgr_events_post(WIFI_MGR_EVENT_KNOWN_AP_UNREACHABLE,
+                             &info, sizeof(info));
+        ESP_LOGW(TAG, "tw expired: stored AP '%s' visible but unreachable "
+                      "(%u attempts, last reason %u)",
+                 info.ssid, info.attempts, info.last_reason);
+    } else {
+        wifi_mgr_events_post(WIFI_MGR_EVENT_NO_KNOWN_AP_IN_TW, NULL, 0);
+    }
+
+    if (auto_provision_allowed()) {
+        start_provisioning_on_tw_expiry();
+        return true;
+    }
+
+    ESP_LOGI(TAG, "tw expired; auto-provisioning not allowed (policy %d, %d "
+                  "stored APs) — re-arming window and continuing",
+             (int)CTX->config.auto_provision, ap_records_get_count());
+    wifi_mgr_tw_window_reset();
+    xTimerStart(CTX->tw_timer, 0);
+    return false;
 }
 
 /* ── RESCAN_ONCE result handler ──────────────────────────────────────────── */
@@ -525,6 +625,12 @@ static void on_rescan_once_result(void)
         wifi_mgr_state_set(WIFI_MGR_STATE_SCANNING);
         wifi_mgr_events_post(WIFI_MGR_EVENT_SCANNING, NULL, 0);
         return;
+    }
+
+    /* BSSID lock only if that BSSID was in this scan (see wifi_mgr_scan.c). */
+    if (bssid_match_idx < 0 ||
+        memcmp(ap.bssid, scan_buf[bssid_match_idx].bssid, 6) != 0) {
+        memset(ap.bssid, 0, sizeof(ap.bssid));
     }
 
     /* Populate connect_list with this single AP and start connecting */
@@ -627,7 +733,7 @@ static void manager_task(void *arg)
                     xTaskNotifyWait(0, UINT32_MAX, &notif,
                                     pdMS_TO_TICKS(CTX->config.inter_scan_delay_ms));
                     if (notif & NOTIFY_STOP) goto cleanup;
-                    if (notif & NOTIFY_TW_EXPIRED) { handle_tw_expired(); }
+                    if (notif & NOTIFY_TW_EXPIRED) { on_tw_expired(); } /* stale → ignored */
                 }
                 continue;
             }
@@ -645,14 +751,43 @@ static void manager_task(void *arg)
             if (CTX->connect_list_count > 0) {
                 /* Known APs available — attempt connection */
                 wifi_mgr_connect_attempt();
+                CTX->tw_attempts++;
+                strncpy(CTX->tw_last_ssid,
+                        CTX->connect_list[CTX->connect_list_index].ssid,
+                        sizeof(CTX->tw_last_ssid) - 1);
+                CTX->tw_last_ssid[sizeof(CTX->tw_last_ssid) - 1] = '\0';
 
-                /* Wait indefinitely for a connect outcome or tw expiry */
-                xTaskNotifyWait(0, UINT32_MAX, &notif, portMAX_DELAY);
-                if (notif & NOTIFY_STOP)           goto cleanup;
-                if (notif & NOTIFY_TW_EXPIRED)     { handle_tw_expired(); continue; }
-                if (notif & NOTIFY_CONNECTED)       { xTimerStop(CTX->tw_timer, 0); on_connect_success(); continue; }
-                if (notif & NOTIFY_CONNECT_TIMEOUT) { on_connect_failure(); continue; }
-                if (notif & NOTIFY_DISCONNECTED)    { on_connect_failure(); continue; }
+                /* Wait for this attempt's outcome. A soft tw expiry (window
+                 * re-armed, no provisioning) must not end the wait: the
+                 * attempt is still in flight, and starting another one on
+                 * top of it would race the driver. connect_timer is always
+                 * armed by wifi_mgr_connect_attempt(), so the loop ends. */
+                for (;;) {
+                    notif = 0;
+                    xTaskNotifyWait(0, UINT32_MAX, &notif, portMAX_DELAY);
+                    if (notif & NOTIFY_STOP) goto cleanup;
+                    if (notif & NOTIFY_TW_EXPIRED) {
+                        if ((notif & NOTIFY_CONNECTED) && !auto_provision_allowed()) {
+                            /* Expiry and IP in the same wakeup, and the
+                             * deadline is soft: the connection wins and the
+                             * expiry is moot (tw stopped just below). No
+                             * KNOWN_AP_UNREACHABLE for an AP that connected. */
+                        } else if (on_tw_expired()) {
+                            break; /* hard deadline: provisioning started (D4) */
+                        }
+                    }
+                    if (notif & NOTIFY_CONNECTED) {
+                        xTimerStop(CTX->tw_timer, 0);
+                        on_connect_success();
+                        break;
+                    }
+                    if (notif & NOTIFY_CONNECT_TIMEOUT) { on_connect_failure(0); break; }
+                    if (notif & NOTIFY_DISCONNECTED) {
+                        on_connect_failure(CTX->disconnect_reason);
+                        break;
+                    }
+                    /* Nothing actionable (soft expiry, stale bits) — keep waiting. */
+                }
                 continue;
 
             } else {
@@ -664,15 +799,31 @@ static void manager_task(void *arg)
                     xTaskNotifyWait(0, UINT32_MAX, &notif,
                                     pdMS_TO_TICKS(CTX->config.inter_scan_delay_ms));
                     if (notif & NOTIFY_STOP)       goto cleanup;
-                    if (notif & NOTIFY_TW_EXPIRED) { handle_tw_expired(); }
+                    if (notif & NOTIFY_TW_EXPIRED) { on_tw_expired(); }
                     continue;
                 }
 
-                xTaskNotifyWait(0, UINT32_MAX, &notif, pdMS_TO_TICKS(scan_watchdog_ms));
-                if (notif & NOTIFY_STOP)       goto cleanup;
-                if (notif & NOTIFY_TW_EXPIRED) { handle_tw_expired(); continue; }
+                /* Wait for SCAN_DONE, bounded by the scan watchdog. A soft
+                 * tw expiry does not abort the scan in flight. */
+                const TickType_t wd_ticks = pdMS_TO_TICKS(scan_watchdog_ms);
+                const TickType_t t0 = xTaskGetTickCount();
+                bool provisioning = false;
+                bool scan_done    = false;
+                for (;;) {
+                    TickType_t elapsed = xTaskGetTickCount() - t0;
+                    if (elapsed >= wd_ticks) break;
+                    notif = 0;
+                    xTaskNotifyWait(0, UINT32_MAX, &notif, wd_ticks - elapsed);
+                    if (notif & NOTIFY_STOP) goto cleanup;
+                    if ((notif & NOTIFY_TW_EXPIRED) && on_tw_expired()) {
+                        provisioning = true;
+                        break;
+                    }
+                    if (notif & NOTIFY_SCAN_DONE) { scan_done = true; break; }
+                }
+                if (provisioning) continue;
 
-                if (notif & NOTIFY_SCAN_DONE) {
+                if (scan_done) {
                     wifi_mgr_scan_handle_results();
                     CTX->consecutive_errors = 0;
 
@@ -682,7 +833,7 @@ static void manager_task(void *arg)
                         xTaskNotifyWait(0, UINT32_MAX, &notif,
                                         pdMS_TO_TICKS(CTX->config.inter_scan_delay_ms));
                         if (notif & NOTIFY_STOP)       goto cleanup;
-                        if (notif & NOTIFY_TW_EXPIRED) { handle_tw_expired(); }
+                        if (notif & NOTIFY_TW_EXPIRED) { on_tw_expired(); }
                     }
                     continue;
                 }
@@ -729,7 +880,7 @@ static void manager_task(void *arg)
                     if (notif & NOTIFY_STOP)           goto cleanup;
                     if (notif & NOTIFY_CONNECTED)       { on_connect_success(); continue; }
                     if (notif & NOTIFY_CONNECT_TIMEOUT) {
-                        on_connect_failure();
+                        on_connect_failure(0);
                         if (CTX->connect_list_count == 0) {
                             /* All retries exhausted */
                             CTX->last_connected_ssid[0] = '\0';
@@ -826,6 +977,15 @@ esp_err_t wifi_mgr_init(const wifi_mgr_config_t *config)
         CTX->config.max_connect_attempts = CONFIG_WIFI_MAX_CONNECT_ATTEMPTS;
     if (CTX->config.use_count_save_interval == 0)
         CTX->config.use_count_save_interval = CONFIG_WIFI_USE_COUNT_SAVE_INTERVAL;
+    if (CTX->config.auto_provision == WIFI_MGR_AUTO_PROV_DEFAULT) {
+#if defined(CONFIG_WIFI_AUTO_PROVISION_ALWAYS)
+        CTX->config.auto_provision = WIFI_MGR_AUTO_PROV_ALWAYS;
+#elif defined(CONFIG_WIFI_AUTO_PROVISION_NEVER)
+        CTX->config.auto_provision = WIFI_MGR_AUTO_PROV_NEVER;
+#else
+        CTX->config.auto_provision = WIFI_MGR_AUTO_PROV_WHEN_UNPROVISIONED;
+#endif
+    }
     if (CTX->config.device_name_prefix[0] == '\0')
         strncpy(CTX->config.device_name_prefix,
                 CONFIG_WIFI_PROV_DEVICE_NAME_PREFIX,
@@ -958,9 +1118,33 @@ esp_err_t wifi_mgr_start(void)
         return ret;
     }
 
-    ret = esp_wifi_start();
+    /* Wipe any STA config the driver kept in its own NVS (nvs.net80211).
+     * network_provisioning writes received credentials there (see
+     * wifi_mgr_driver_wipe_config() in wifi_mgr_prov.c), so units that
+     * provisioned under 0.1.x/0.2.x — or lost power mid-session — carry a
+     * stale or unverified password. Done here, after set_mode(STA) (needed
+     * for the STA interface) and before esp_wifi_start(), so no connection
+     * can be in progress. The driver is still in its default FLASH storage
+     * mode at this point; the wipe ends in RAM mode. Only writes when
+     * something is stored, so normal boots cost no flash write. */
+    {
+        wifi_config_t stored;
+        memset(&stored, 0, sizeof(stored));
+        if (esp_wifi_get_config(WIFI_IF_STA, &stored) == ESP_OK &&
+            stored.sta.ssid[0] != '\0') {
+            ESP_LOGI(TAG, "Wiping STA config stored in driver NVS");
+            wifi_mgr_driver_wipe_config();
+        }
+    }
+
+    /* CRITICAL: ap_records is the sole credential authority.
+     * WIFI_STORAGE_RAM keeps esp_wifi_set_config() calls (one per connect
+     * attempt) out of flash. Set before esp_wifi_start(). network_provisioning
+     * flips this back to FLASH; wifi_mgr_prov.c re-applies RAM afterwards. */
+    ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "esp_wifi_set_storage(RAM) failed: %s — FATAL",
+                 esp_err_to_name(ret));
         esp_wifi_deinit();
         esp_netif_destroy_default_wifi(CTX->sta_netif);
         CTX->sta_netif = NULL;
@@ -969,14 +1153,9 @@ esp_err_t wifi_mgr_start(void)
         return ret;
     }
 
-    /* CRITICAL: ap_records is the sole credential authority.
-     * WIFI_STORAGE_RAM prevents the driver from caching credentials in NVS
-     * and auto-connecting on next boot (which would bypass ap_records). */
-    ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    ret = esp_wifi_start();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "esp_wifi_set_storage(RAM) failed: %s — FATAL",
-                 esp_err_to_name(ret));
-        esp_wifi_stop();
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(ret));
         esp_wifi_deinit();
         esp_netif_destroy_default_wifi(CTX->sta_netif);
         CTX->sta_netif = NULL;

@@ -60,14 +60,14 @@ component is designed around those cases.
 Requires **ESP-IDF v6.0 or later**. (v0.1.x supports ESP-IDF v5.x.)
 
 ```bash
-idf.py add-dependency "embedblocks/wifi-manager^0.2.0"
+idf.py add-dependency "embedblocks/wifi-manager^0.3.0"
 ```
 
 Or in `idf_component.yml`:
 
 ```yaml
 dependencies:
-  embedblocks/wifi-manager: "^0.2.0"
+  embedblocks/wifi-manager: "^0.3.0"
 ```
 
 `espressif/network_provisioning` (the registry replacement for the
@@ -178,6 +178,7 @@ All timing and behaviour is controlled via Kconfig
 |---|---|---|
 | `CONFIG_MAX_AP_COUNT` | 5 | Max stored credentials |
 | `CONFIG_WIFI_KNOWN_AP_WAIT_MS` | 120 000 | Time-window deadline (ms) |
+| `CONFIG_WIFI_AUTO_PROVISION` | `WHEN_UNPROVISIONED` | When tw expiry may start BLE provisioning on its own (also `wifi_mgr_config_t.auto_provision`) |
 | `CONFIG_WIFI_INTER_SCAN_DELAY_MS` | 3 000 | Delay between scan cycles |
 | `CONFIG_WIFI_CONNECT_TIMEOUT_MS` | 8 000 | Per-AP connection timeout |
 | `CONFIG_WIFI_MAX_CONNECT_ATTEMPTS` | 3 | Retries per AP per TW cycle |
@@ -204,6 +205,14 @@ case WIFI_MGR_EVENT_PROVISIONING_STARTED:
 case WIFI_MGR_EVENT_DISCONNECTED:
     /* manager handles reconnect automatically — no action needed */
     break;
+case WIFI_MGR_EVENT_KNOWN_AP_UNREACHABLE: {
+    /* stored network in range, but every attempt fails (password changed?).
+     * Never auto-re-provisions — prompt the user, then call
+     * wifi_mgr_start_ble_provisioning() if they confirm. */
+    wifi_mgr_known_ap_unreachable_t *u = data;
+    ESP_LOGW(TAG, "%s unreachable, reason %u", u->ssid, u->last_reason);
+    break;
+}
 ```
 
 Full event reference in `docs/09_event_system.md`.
@@ -238,6 +247,11 @@ No direct `esp_wifi_*` calls are needed or expected from application code.
 A full list with mitigations is in `docs/01_overview.md`. The most
 operationally relevant:
 
+- **Recovering from a changed router password needs a manual trigger.**
+  Under the default `auto_provision` policy a provisioned device never
+  re-enters BLE provisioning by itself; it posts
+  `WIFI_MGR_EVENT_KNOWN_AP_UNREACHABLE` and keeps trying. Give the product
+  a way to call `wifi_mgr_start_ble_provisioning()` (button, gesture, app).
 - **Hidden SSIDs** require `CONFIG_WIFI_SCAN_HIDDEN=y`
 - **Duplicate SSIDs** (two networks, same name, different passwords) —
   only one credential can be stored; SSID is the primary key

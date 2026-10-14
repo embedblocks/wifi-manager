@@ -97,12 +97,22 @@ typedef enum {
                                                     data → wifi_mgr_connected_info_t */
     WIFI_MGR_EVENT_DISCONNECTED         = 5,  /**< Link dropped; cycle restarting
                                                     data → wifi_mgr_disconnected_info_t */
-    WIFI_MGR_EVENT_NO_KNOWN_AP_IN_TW    = 6,  /**< tw expired; no connection made */
+    WIFI_MGR_EVENT_NO_KNOWN_AP_IN_TW    = 6,  /**< tw expired and no stored AP was
+                                                    visible during the window. BLE
+                                                    provisioning follows only if
+                                                    auto_provision allows it — watch
+                                                    PROVISIONING_STARTED, not this. */
     WIFI_MGR_EVENT_PROVISIONING_STARTED = 7,  /**< BLE advertisement active */
     WIFI_MGR_EVENT_PROVISIONING_DONE    = 8,  /**< Credentials received and connected */
     WIFI_MGR_EVENT_PROVISIONING_FAILED  = 9,  /**< Prov timed out or errored */
     WIFI_MGR_EVENT_ERROR                = 10, /**< Internal ESP error
                                                     data → wifi_mgr_error_info_t */
+    WIFI_MGR_EVENT_KNOWN_AP_UNREACHABLE = 11, /**< tw expired; a stored AP WAS visible
+                                                    but every connection attempt failed
+                                                    (e.g. its password changed).
+                                                    data → wifi_mgr_known_ap_unreachable_t.
+                                                    Re-posted every tw period while the
+                                                    condition persists. */
 } wifi_mgr_event_id_t;
 
 /* ── Event data structures ───────────────────────────────────────────────── */
@@ -181,6 +191,41 @@ typedef struct {
 } wifi_mgr_error_info_t;
 
 /**
+ * @brief Posted with WIFI_MGR_EVENT_KNOWN_AP_UNREACHABLE.
+ *
+ * Describes the most recent failed attempt in the expired tw window.
+ * last_reason is the raw wifi_reason_t of the last disconnect, or 0 if the
+ * last attempt hit connect_timeout_ms without the driver reporting a reason.
+ * Repeated WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT (15) / WIFI_REASON_AUTH_FAIL
+ * usually means the stored password is wrong — but a look-alike AP with the
+ * same SSID produces the same codes, which is why the component never
+ * starts provisioning on its own because of this event. The application
+ * decides (e.g. prompt the user, then call wifi_mgr_start_ble_provisioning()).
+ */
+typedef struct {
+    char     ssid[33];     /**< SSID of the last AP attempted (null-terminated) */
+    uint16_t last_reason;  /**< Raw wifi_reason_t, or 0 = connect timeout */
+    uint16_t attempts;     /**< Connection attempts made in the expired window */
+} wifi_mgr_known_ap_unreachable_t;
+
+/**
+ * @brief When the component may start BLE provisioning on its own (tw expiry).
+ *
+ * wifi_mgr_start_ble_provisioning() works under every policy.
+ */
+typedef enum {
+    WIFI_MGR_AUTO_PROV_DEFAULT            = 0, /**< Use CONFIG_WIFI_AUTO_PROVISION_* */
+    WIFI_MGR_AUTO_PROV_WHEN_UNPROVISIONED = 1, /**< Only if no credentials are stored
+                                                 *  (checked when tw expires). Default. */
+    WIFI_MGR_AUTO_PROV_ALWAYS             = 2, /**< 0.1.x/0.2.x behaviour: on every tw
+                                                 *  expiry. Not recommended — a long
+                                                 *  router outage with neighbours' APs
+                                                 *  visible drops a provisioned node
+                                                 *  into BLE provisioning. */
+    WIFI_MGR_AUTO_PROV_NEVER              = 3, /**< Only via wifi_mgr_start_ble_provisioning() */
+} wifi_mgr_auto_prov_t;
+
+/**
  * @brief Configuration for wifi_mgr_init().
  *
  * Set any field to 0 / NULL to use the Kconfig default.
@@ -204,6 +249,8 @@ typedef struct {
     uint8_t  max_connect_attempts;    /**< Retries per AP (0 → Kconfig) */
     uint8_t  use_count_save_interval; /**< Saves per N connections (0 → Kconfig) */
     char     device_name_prefix[16];  /**< BLE name prefix (empty → Kconfig) */
+    wifi_mgr_auto_prov_t auto_provision; /**< When tw expiry may start BLE
+                                            *  provisioning (DEFAULT → Kconfig) */
 } wifi_mgr_config_t;
 
 /* ── ap_info_t forward declaration for stored-AP queries ─────────────────── */

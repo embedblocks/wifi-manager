@@ -78,6 +78,47 @@ menu "WiFi Manager"
             to the next AP in the connect list. First attempt uses BSSID lock
             (if BSSID is stored); subsequent attempts use SSID-only.
 
+    choice WIFI_AUTO_PROVISION
+        prompt "Automatic BLE provisioning on tw expiry"
+        default WIFI_AUTO_PROVISION_WHEN_UNPROVISIONED
+        help
+            Decides whether the component may start BLE provisioning by
+            itself when the tw window (WIFI_KNOWN_AP_WAIT_MS) expires without
+            a connection. Runtime override: wifi_mgr_config_t.auto_provision.
+            wifi_mgr_start_ble_provisioning() works under every option.
+
+            When provisioning is not allowed, tw expiry posts
+            WIFI_MGR_EVENT_NO_KNOWN_AP_IN_TW or
+            WIFI_MGR_EVENT_KNOWN_AP_UNREACHABLE, re-arms the window and keeps
+            scanning. It never disconnects and never discards a connection
+            that completes at the same moment.
+
+        config WIFI_AUTO_PROVISION_WHEN_UNPROVISIONED
+            bool "Only when no credentials are stored (recommended)"
+            help
+                First-boot devices provision automatically. A device that
+                already holds credentials never does: a router that takes
+                longer than tw to reboot, with neighbours' APs in range,
+                no longer drops it into BLE provisioning (and into
+                accepting credentials from anyone in BLE range). The
+                stored-credential count is checked when tw expires, so
+                removing every credential re-enables it.
+
+        config WIFI_AUTO_PROVISION_ALWAYS
+            bool "On every tw expiry (0.1.x / 0.2.x behaviour)"
+            help
+                Kept for compatibility. Not recommended for devices that
+                stay installed: see the WHEN_UNPROVISIONED help text.
+
+        config WIFI_AUTO_PROVISION_NEVER
+            bool "Never — only via wifi_mgr_start_ble_provisioning()"
+            help
+                For products that always have a physical provisioning
+                trigger (button, power-cycle gesture). Note that a
+                first-boot device then sits in scanning until the
+                application calls wifi_mgr_start_ble_provisioning().
+    endchoice
+
     choice WIFI_PROV_AUTH_MODE
         prompt "Provisioning security mode"
         default WIFI_PROV_AUTH_MODE_MAC_POP

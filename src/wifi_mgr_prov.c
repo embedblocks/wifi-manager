@@ -146,21 +146,29 @@ static void wifi_mgr_prov_event_handler(void *arg,
     switch ((network_prov_cb_event_t)event_id) {
 
     case NETWORK_PROV_WIFI_CRED_RECV: {
-        /* Credentials received from the provisioning app.
-         * Add to ap_records in RAM; defer NVS save to on_prov_done()
-         * which runs in the manager task context (not the system event task).
-         * The system event task must not block on NVS writes (~10-20ms). */
+        /* Credentials received from the provisioning app, NOT yet verified.
+         * Hold them in RAM only. They reach ap_records in on_prov_done(),
+         * after NETWORK_PROV_WIFI_CRED_SUCCESS proves they work. Adding them
+         * here (0.1.x/0.2.x behaviour) let anyone in BLE range plant a
+         * credential at use_count = max + 1 — top priority, evicting a real
+         * one when the store was full — whether or not it ever connected.
+         *
+         * wifi_sta_config_t.ssid / .password are fixed-size and need not be
+         * NUL-terminated at full length; copy bounded and terminate. */
         wifi_sta_config_t *sta = (wifi_sta_config_t *)event_data;
-        esp_err_t ret = ap_records_add((const char *)sta->ssid,
-                                       (const char *)sta->password,
-                                       NULL);
-        if (ret == ESP_OK) {
-            CTX->pending_nvs_save = true;
-            ESP_LOGI(TAG, "Credentials received for SSID: %s (NVS save deferred)",
-                     sta->ssid);
-        } else {
-            ESP_LOGE(TAG, "ap_records_add failed: %s", esp_err_to_name(ret));
-        }
+        memset(CTX->held_ssid, 0, sizeof(CTX->held_ssid));
+        memset(CTX->held_password, 0, sizeof(CTX->held_password));
+        memset(CTX->held_bssid, 0, sizeof(CTX->held_bssid));
+        memcpy(CTX->held_ssid, sta->ssid,
+               sizeof(sta->ssid) < sizeof(CTX->held_ssid) - 1
+                   ? sizeof(sta->ssid) : sizeof(CTX->held_ssid) - 1);
+        memcpy(CTX->held_password, sta->password,
+               sizeof(sta->password) < sizeof(CTX->held_password) - 1
+                   ? sizeof(sta->password) : sizeof(CTX->held_password) - 1);
+        CTX->held_confirmed = false;
+        CTX->held_valid     = (CTX->held_ssid[0] != '\0');
+        ESP_LOGI(TAG, "Credentials received for SSID: %s (held until connection "
+                      "is confirmed)", CTX->held_ssid);
         break;
     }
 
@@ -178,6 +186,20 @@ static void wifi_mgr_prov_event_handler(void *arg,
          * IP event handler). Only overwrite SSID/BSSID here. */
         memcpy(CTX->conn_info.ssid, ap_info.ssid, sizeof(CTX->conn_info.ssid));
         memcpy(CTX->conn_info.bssid, ap_info.bssid, 6);
+
+        /* Mark the held credential as confirmed. Record the BSSID only when
+         * the AP we ended up on carries the SSID we were given — otherwise
+         * store the credential without a BSSID rather than a wrong one. */
+        if (CTX->held_valid &&
+            strncmp((const char *)ap_info.ssid, CTX->held_ssid,
+                    sizeof(CTX->held_ssid)) == 0) {
+            memcpy(CTX->held_bssid, ap_info.bssid, sizeof(CTX->held_bssid));
+        } else if (CTX->held_valid) {
+            ESP_LOGW(TAG, "Connected SSID '%.32s' differs from provisioned "
+                          "SSID '%s' — saving without BSSID",
+                     (const char *)ap_info.ssid, CTX->held_ssid);
+        }
+        CTX->held_confirmed = CTX->held_valid;
 
         xTimerStop(CTX->prov_timer, 0);
         xTaskNotify(CTX->task_handle, NOTIFY_PROV_DONE, eSetBits);
@@ -244,6 +266,74 @@ static void prov_mgr_safe_deinit(void)
     ESP_LOGD(TAG, "prov_mgr deinitialized");
 }
 
+/* ── Driver credential hygiene ───────────────────────────────────────────── */
+
+/*
+ * network_provisioning undermines WIFI_STORAGE_RAM, which wifi_mgr_start()
+ * relies on to keep ap_records the only credential store:
+ *   - every network_prov_mgr_start_provisioning() call leaves the driver in
+ *     WIFI_STORAGE_FLASH on exit, unconditionally (manager.c, "Restore WiFi
+ *     storage back to FLASH" — the IDF Wi-Fi API has no storage getter, so
+ *     it cannot restore the previous mode);
+ *   - on NETWORK_PROV_WIFI_CRED_RECV it switches to FLASH and calls
+ *     esp_wifi_set_config() with the received, unverified credentials,
+ *     which writes them into the driver's own NVS namespace (nvs.net80211).
+ * Left alone, every later wifi_mgr_connect_attempt() then writes to flash
+ * whenever the config changes, and the driver's NVS keeps a password that
+ * wifi_mgr_remove_ap() / wifi_mgr_reset_provisioning() never erase.
+ *
+ * Compensation:
+ *   - wifi_mgr_driver_storage_ram(): after every start_provisioning() call
+ *     and at the end of every session (any outcome). Only changes where
+ *     future writes go; does not touch the current config or the link.
+ *   - wifi_mgr_driver_wipe_config(): only while the station is NOT
+ *     connected — after a failed/timed-out session, and in wifi_mgr_start()
+ *     before esp_wifi_start(). The success path is not wiped live: the
+ *     stored password is the verified one, and the next start-up wipe
+ *     removes it (wifi_mgr_reset_provisioning() goes through stop/start).
+ */
+void wifi_mgr_driver_storage_ram(void)
+{
+    esp_err_t ret = esp_wifi_set_storage(WIFI_STORAGE_RAM);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "esp_wifi_set_storage(RAM) failed: %s",
+                 esp_err_to_name(ret));
+    }
+}
+
+esp_err_t wifi_mgr_driver_wipe_config(void)
+{
+    wifi_config_t empty;
+    memset(&empty, 0, sizeof(empty));
+
+    esp_err_t ret = esp_wifi_set_storage(WIFI_STORAGE_FLASH);
+    if (ret == ESP_OK) {
+        ret = esp_wifi_set_config(WIFI_IF_STA, &empty);
+    }
+    /* Always end in RAM mode, even if the overwrite failed. */
+    wifi_mgr_driver_storage_ram();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Could not wipe driver-stored STA config: %s "
+                      "(will retry at next start)", esp_err_to_name(ret));
+    } else {
+        ESP_LOGD(TAG, "Driver-stored STA config wiped");
+    }
+    return ret;
+}
+
+void wifi_mgr_prov_wipe_held_creds(void)
+{
+    /* volatile pointer so the compiler cannot elide the password wipe */
+    volatile char *p = CTX->held_password;
+    for (size_t i = 0; i < sizeof(CTX->held_password); i++) {
+        p[i] = 0;
+    }
+    memset(CTX->held_ssid, 0, sizeof(CTX->held_ssid));
+    memset(CTX->held_bssid, 0, sizeof(CTX->held_bssid));
+    CTX->held_valid     = false;
+    CTX->held_confirmed = false;
+}
+
 /* ── Public functions ────────────────────────────────────────────────────── */
 
 esp_err_t wifi_mgr_prov_start(void)
@@ -278,6 +368,7 @@ esp_err_t wifi_mgr_prov_start(void)
         esp_err_t ret = network_prov_mgr_start_provisioning(
             CTX->prov_security, CTX->prov_pop[0] != '\0' ? CTX->prov_pop : NULL,
             CTX->prov_device_name, NULL);
+        wifi_mgr_driver_storage_ram(); /* start_provisioning() exits in FLASH mode */
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "network_prov_mgr_start_provisioning (retry) failed: %s",
                      esp_err_to_name(ret));
@@ -457,6 +548,7 @@ esp_err_t wifi_mgr_prov_start(void)
     /* Start provisioning */
     ret = network_prov_mgr_start_provisioning(security, pop,
                                            CTX->prov_device_name, NULL);
+    wifi_mgr_driver_storage_ram(); /* start_provisioning() exits in FLASH mode */
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "network_prov_mgr_start_provisioning failed: %s",
                  esp_err_to_name(ret));
@@ -580,6 +672,18 @@ bool wifi_mgr_prov_stop_failed_attempt(void)
                       "— proceeding to retry anyway",
                  WIFI_PROV_STOP_CONFIRM_WAIT_MS);
     }
+
+    /* Session failed: whatever arrived was never verified. Drop it from
+     * RAM, and overwrite the copy network_provisioning wrote into the
+     * driver's NVS at CRED_RECV. The station is not connected on this
+     * path; disconnect first anyway so a connect still in flight inside
+     * the provisioning manager cannot make esp_wifi_set_config() fail with
+     * ESP_ERR_WIFI_STATE. The resulting STA_DISCONNECTED is ignored in
+     * PROVISIONING. wifi_mgr_driver_wipe_config() also restores RAM mode. */
+    wifi_mgr_prov_wipe_held_creds();
+    esp_wifi_disconnect();
+    wifi_mgr_driver_wipe_config();
+
     ESP_LOGD(TAG, "Provisioning attempt stopped (session kept alive for retry)");
     return false;
 }
@@ -588,6 +692,12 @@ void wifi_mgr_prov_stop_succeeded(void)
 {
     xTimerStop(CTX->prov_timer, 0);
     network_prov_mgr_stop_provisioning();
+
+    /* CRED_RECV left the driver in FLASH mode. Restore RAM mode so later
+     * reconnects don't write to flash. The driver-stored config is not
+     * wiped here — the station is connected, and it holds the verified
+     * credential; the next wifi_mgr_start() wipes it. */
+    wifi_mgr_driver_storage_ram();
 
 #if defined(CONFIG_WIFI_PROV_BT_LIFECYCLE_FREE_ON_SUCCESS)
     /* Wait for confirmed BLE teardown before deinitializing — same race
@@ -638,6 +748,10 @@ void wifi_mgr_prov_stop_shutdown(void)
      * proceed anyway — deinit is still safer than skipping it. */
     xTimerStop(CTX->prov_timer, 0);
     network_prov_mgr_stop_provisioning();
+    wifi_mgr_prov_wipe_held_creds();
+    /* No driver wipe here: wifi_mgr_stop() deinitializes Wi-Fi next, and
+     * the next wifi_mgr_start() wipes any stored config before starting. */
+    wifi_mgr_driver_storage_ram();
     xSemaphoreTake(CTX->prov_stop_confirm_sem,
                    pdMS_TO_TICKS(WIFI_PROV_STOP_CONFIRM_WAIT_MS));
     prov_mgr_safe_deinit();
